@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+.idea/
+*.bak
+*.bak-agent
+.DS_Store
