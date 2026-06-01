@@ -1,6 +1,14 @@
 #include "AutopilotWatchy.h"
 
-#include <cmath>
+#include "display_session.h"
+#include <cstring>
+#include <stdarg.h>
+
+#include "esp_sleep.h"
+
+#if !SIM_MODE
+#include <WiFi.h>
+#endif
 
 #ifdef ARDUINO_ESP32S3_DEV
 #define BTN_ACTIVE 0
@@ -19,7 +27,148 @@
 RTC_DATA_ATTR float AutopilotWatchy::targetHeadingDeg = 335.0f;
 RTC_DATA_ATTR ApDisplayState AutopilotWatchy::apState = ApDisplayState::Auto;
 RTC_DATA_ATTR bool AutopilotWatchy::targetValid = true;
-RTC_DATA_ATTR bool AutopilotWatchy::skLinked = true;
+RTC_DATA_ATTR bool AutopilotWatchy::skLinked = false;
+RTC_DATA_ATTR char AutopilotWatchy::profileLabel[8] = "";
+RTC_DATA_ATTR int8_t AutopilotWatchy::pendingWakeHeadingDelta = 0;
+
+namespace {
+
+volatile uint8_t wakeHeadingEdges = 0;
+
+bool headingBtnPressed(uint64_t btnMask) {
+  if (btnMask == AP_DOWN_BTN_MASK) {
+    return digitalRead(DOWN_BTN_PIN) == BTN_ACTIVE;
+  }
+  if (btnMask == AP_UP_BTN_MASK) {
+    return digitalRead(UP_BTN_PIN) == BTN_ACTIVE;
+  }
+  return false;
+}
+
+void IRAM_ATTR wakeHeadingEdgeIsr() {
+  static uint32_t lastUs = 0;
+  const uint32_t now = micros();
+  if (now - lastUs < (BTN_DEBOUNCE_MS * 1000UL)) {
+    return;
+  }
+  lastUs = now;
+  if (wakeHeadingEdges < 10) {
+    wakeHeadingEdges++;
+  }
+}
+
+} // namespace
+
+void AutopilotWatchy::captureWakeHeadingDeltaEarly() {
+  pendingWakeHeadingDelta = 0;
+  wakeHeadingEdges = 0;
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) {
+    return;
+  }
+  const uint64_t w = esp_sleep_get_ext1_wakeup_status();
+  if (w != AP_UP_BTN_MASK && w != AP_DOWN_BTN_MASK) {
+    return;
+  }
+
+  const bool up = (w == AP_UP_BTN_MASK);
+  const int pin = up ? UP_BTN_PIN : DOWN_BTN_PIN;
+  pinMode(UP_BTN_PIN, INPUT);
+  pinMode(DOWN_BTN_PIN, INPUT);
+
+  wakeHeadingEdges = 1;
+  attachInterrupt(digitalPinToInterrupt(pin), wakeHeadingEdgeIsr, RISING);
+
+  unsigned long deadline = millis() + BTN_WAKE_BURST_MS;
+  while ((long)(deadline - millis()) > 0) {
+    if (headingBtnPressed(w)) {
+      unsigned long heldMs = 0;
+      while (headingBtnPressed(w)) {
+        delay(10);
+        heldMs += 10;
+        if (heldMs >= BTN_HOLD_ADJUST_MS) {
+          detachInterrupt(digitalPinToInterrupt(pin));
+          while (headingBtnPressed(w)) {
+            delay(5);
+          }
+          pendingWakeHeadingDelta = up ? 10 : -10;
+          return;
+        }
+      }
+    }
+    delay(5);
+  }
+
+  detachInterrupt(digitalPinToInterrupt(pin));
+
+  int count = (int)wakeHeadingEdges;
+  if (count > 5) {
+    count = 5;
+  }
+  pendingWakeHeadingDelta = (int8_t)(up ? count : -count);
+}
+
+int AutopilotWatchy::consumePendingWakeHeadingDelta() {
+  const int delta = (int)pendingWakeHeadingDelta;
+  pendingWakeHeadingDelta = 0;
+  return delta;
+}
+
+int AutopilotWatchy::collectWakeHeadingDeltaImpl(uint64_t btnMask,
+                                                 int initialDelta,
+                                                 uint16_t windowMs) {
+  const bool up = (btnMask == AP_UP_BTN_MASK);
+  pinMode(UP_BTN_PIN, INPUT);
+  pinMode(DOWN_BTN_PIN, INPUT);
+
+  if (initialDelta == 10 || initialDelta == -10) {
+    return initialDelta;
+  }
+
+  int count = (initialDelta != 0) ? abs(initialDelta) : 0;
+
+  if (headingBtnPressed(btnMask)) {
+    unsigned long heldMs = 0;
+    while (headingBtnPressed(btnMask)) {
+      delay(10);
+      heldMs += 10;
+      if (heldMs >= BTN_HOLD_ADJUST_MS) {
+        while (headingBtnPressed(btnMask)) {
+          delay(5);
+        }
+        return up ? 10 : -10;
+      }
+    }
+    if (count == 0) {
+      count = 1;
+    } else {
+      count++;
+    }
+  } else if (count == 0) {
+    count = 1;
+  }
+
+  unsigned long deadline = millis() + windowMs;
+  while ((long)(deadline - millis()) > 0) {
+    if (headingBtnPressed(btnMask)) {
+      unsigned long heldMs = 0;
+      while (headingBtnPressed(btnMask)) {
+        delay(10);
+        heldMs += 10;
+        if (heldMs >= BTN_HOLD_ADJUST_MS) {
+          while (headingBtnPressed(btnMask)) {
+            delay(5);
+          }
+          return up ? 10 : -10;
+        }
+      }
+      count++;
+      deadline = millis() + windowMs;
+    }
+    delay(5);
+  }
+
+  return up ? count : -count;
+}
 
 const char *AutopilotWatchy::btnName(uint64_t mask) {
   if (mask == AP_MENU_BTN_MASK) {
@@ -39,18 +188,16 @@ const char *AutopilotWatchy::btnName(uint64_t mask) {
 
 void AutopilotWatchy::logState(const char *tag) {
 #if AP_DEBUG
-  AP_LOG("%s state=%s target=%.0f valid=%d sk=%d vbat=%.2f", tag,
-         stateLabel(), targetHeadingDeg, (int)targetValid, (int)skLinked,
+  const int hdg = (int)roundf(apNormalizeHeadingDeg(targetHeadingDeg));
+  AP_LOG("%s state=%s target=%03d valid=%d sk=%d vbat=%.2f", tag,
+         stateLabel(), hdg, (int)targetValid, (int)skLinked,
          getBatteryVoltage());
 #endif
 }
 
 void AutopilotWatchy::formatHeading(float deg, char *buf, size_t len) const {
-  int rounded = (int)roundf(deg) % 360;
-  if (rounded < 0) {
-    rounded += 360;
-  }
-  snprintf(buf, len, "%d°", rounded);
+  const int rounded = (int)roundf(apNormalizeHeadingDeg(deg));
+  snprintf(buf, len, "%03d", rounded);
 }
 
 const char *AutopilotWatchy::stateLabel() const {
@@ -115,7 +262,7 @@ void AutopilotWatchy::drawWatchFace() {
   if (targetValid && apState != ApDisplayState::Wind) {
     formatHeading(targetHeadingDeg, buf, sizeof(buf));
   } else {
-    snprintf(buf, sizeof(buf), "---°");
+    snprintf(buf, sizeof(buf), "---");
   }
 
   display.setFont(&DSEG7_Classic_Bold_53);
@@ -126,13 +273,15 @@ void AutopilotWatchy::drawWatchFace() {
   display.setCursor(70, 130);
   display.print(stateLabel());
 
-#if SIM_MODE
+  display.setFont(&FreeMonoBold9pt7b);
   display.setCursor(5, 190);
+#if SIM_MODE
   display.print("SIM");
 #else
-  if (!skLinked) {
-    display.setCursor(5, 190);
-    display.print("NO SK LINK");
+  if (skLinked && profileLabel[0] != '\0') {
+    display.print(profileLabel);
+  } else {
+    display.print("NO SK");
   }
 #endif
 }
@@ -219,15 +368,130 @@ ApCommand AutopilotWatchy::resolveSelect() {
   int presses = countPresses(AP_MENU_BTN_MASK, BTN_SELECT_MULTI_WINDOW_MS, 2);
   if (presses >= 2) {
     longVibeNext = true;
+    if (apState == ApDisplayState::Standby) {
+      return ApCommand::SetAuto;
+    }
     if (apState == ApDisplayState::Auto) {
       return ApCommand::SetWind;
     }
+    if (apState == ApDisplayState::Wind) {
+      return ApCommand::SetAuto;
+    }
     return ApCommand::SetAuto;
   }
-  if (presses == 1 && apState == ApDisplayState::Standby) {
-    return ApCommand::SetAuto;
-  }
+  // Single click: wake screen only (no autopilot command).
   return ApCommand::None;
+}
+
+int AutopilotWatchy::sessionCollectHeadingDelta(uint64_t btnMask) {
+  const bool up = (btnMask == AP_UP_BTN_MASK);
+
+  unsigned long heldMs = 0;
+  while (isPressed(btnMask)) {
+    delay(10);
+    heldMs += 10;
+    if (heldMs >= BTN_HOLD_ADJUST_MS) {
+      while (isPressed(btnMask)) {
+        delay(5);
+      }
+      return up ? 10 : -10;
+    }
+  }
+
+  int count = 1;
+  unsigned long deadline = millis() + BTN_SESSION_BURST_MS;
+  while ((long)(deadline - millis()) > 0) {
+    if (isPressed(btnMask)) {
+      heldMs = 0;
+      while (isPressed(btnMask)) {
+        delay(10);
+        heldMs += 10;
+        if (heldMs >= BTN_HOLD_ADJUST_MS) {
+          while (isPressed(btnMask)) {
+            delay(5);
+          }
+          return up ? 10 : -10;
+        }
+      }
+      count++;
+      deadline = millis() + BTN_SESSION_BURST_MS;
+    }
+    delay(5);
+  }
+
+  return up ? count : -count;
+}
+
+int AutopilotWatchy::collectWakeHeadingDelta(uint64_t btnMask) {
+  return collectWakeHeadingDeltaImpl(btnMask);
+}
+
+void AutopilotWatchy::sessionDisplayTick(bool force) {
+  (void)force;
+#if SIM_MODE
+  if (!activeSession) {
+    return;
+  }
+  showWatchFace(true);
+  sessionLastDisplayMs = millis();
+#else
+  // Live session: no e-paper while WiFi active (brownout / crash on Watchy).
+#endif
+}
+
+void AutopilotWatchy::handleSessionHeadingPress(uint64_t btnMask) {
+  const int delta = sessionCollectHeadingDelta(btnMask);
+  if (delta == 0) {
+    return;
+  }
+  if (!executeSessionHeadingDelta(delta)) {
+    return;
+  }
+#if SIM_MODE
+  sessionDisplayTick(true);
+#endif
+}
+
+bool AutopilotWatchy::executeSessionHeadingDelta(int delta) {
+  if (apState == ApDisplayState::Standby) {
+    AP_LOG("ignore heading adjust in STANDBY");
+    return false;
+  }
+
+  AP_LOG("command %s%d", delta > 0 ? "+" : "", delta);
+
+#if SIM_MODE
+  targetHeadingDeg += (float)delta;
+  targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
+  logState("after");
+  if (delta <= -10 || delta >= 10) {
+    vibeDouble();
+  } else {
+    vibeForDelta(delta);
+  }
+  return true;
+#else
+  const bool ok = SignalKClient::putAdjustHeading(delta);
+  if (ok) {
+    if (!refreshFromSignalK()) {
+      AP_LOG("SK read after PUT failed");
+    }
+    if (delta <= -10 || delta >= 10) {
+      vibeDouble();
+    } else {
+      vibeForDelta(delta);
+    }
+    logState("after");
+    pendingSessionDisplay = true;
+    lastBatchOkMs = millis();
+    return true;
+  }
+
+  AP_LOG("command failed — no vibration");
+  refreshFromSignalK();
+  logState("after");
+  return false;
+#endif
 }
 
 uint64_t AutopilotWatchy::pollButtonDown(uint32_t timeoutMs) {
@@ -255,17 +519,163 @@ uint64_t AutopilotWatchy::pollButtonDown(uint32_t timeoutMs) {
   return 0;
 }
 
+void AutopilotWatchy::waitButtonsReleased() {
+  pinMode(MENU_BTN_PIN, INPUT);
+  pinMode(UP_BTN_PIN, INPUT);
+  pinMode(DOWN_BTN_PIN, INPUT);
+  pinMode(BACK_BTN_PIN, INPUT);
+
+  while (isPressed(AP_MENU_BTN_MASK) || isPressed(AP_UP_BTN_MASK) ||
+         isPressed(AP_DOWN_BTN_MASK) ||
+         digitalRead(BACK_BTN_PIN) == BTN_ACTIVE) {
+    delay(5);
+  }
+  delay(BTN_DEBOUNCE_MS);
+}
+
+void AutopilotWatchy::syncLiveDataBeforeDisplay() {
+#if !SIM_MODE
+  if (SignalKClient::ensureConnected()) {
+    syncClockFromNtp();
+    if (!refreshFromSignalK()) {
+      AP_LOG("SK read failed");
+    }
+  } else {
+    skLinked = false;
+    profileLabel[0] = '\0';
+    AP_LOG("WiFi connect failed");
+  }
+#endif
+}
+
+void AutopilotWatchy::paintWatchFaceFull(bool reinitPanel) {
+  (void)reinitPanel;
+  // Stock Watchy setupWifi pattern: no light sleep during refresh, always full init.
+  display.epd2.setBusyCallback(0);
+  display.epd2.initWatchyFull();
+  display.setFullWindow();
+  RTC.read(currentTime);
+  const unsigned long t0 = millis();
+  drawWatchFace();
+  display.display(false);
+  display.epd2.setBusyCallback(WatchyDisplay::busyCallback);
+  guiState = WATCHFACE_STATE;
+  AP_LOG("display refresh %lums", millis() - t0);
+}
+
+void AutopilotWatchy::refreshDisplaySafe() {
+  gDisplayWifiSession = false;
+#if !SIM_MODE
+  SignalKClient::disconnect();
+  delay(300);
+#endif
+  RTC.read(currentTime);
+  AP_LOG("display %02d:%02d target=%03d state=%s sk=%d", currentTime.Hour,
+         currentTime.Minute, (int)roundf(targetHeadingDeg), stateLabel(),
+         (int)skLinked);
+  paintWatchFaceFull(true);
+  AP_LOG("display done");
+}
+
+void AutopilotWatchy::bootSyncBeforeDisplay() {
+#if !SIM_MODE
+  skLinked = false;
+  profileLabel[0] = '\0';
+  AP_LOG("boot live sync");
+  syncLiveDataBeforeDisplay();
+  SignalKClient::disconnect();
+  delay(300);
+#endif
+  paintWatchFaceFull(true);
+}
+
+void AutopilotWatchy::syncClockFromNtp() {
+#if !SIM_MODE
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if (syncNTP(settings.gmtOffset)) {
+    AP_LOG("NTP sync ok");
+  } else {
+    AP_LOG("NTP sync failed");
+  }
+#endif
+}
+
+void AutopilotWatchy::sessionDisplayAfterBatch() {
+  if (sessionDisplayInProgress) {
+    return;
+  }
+  sessionDisplayInProgress = true;
+  pendingSessionDisplay = false;
+
+  AP_LOG("batch display");
+  refreshDisplaySafe();
+  sessionLastDisplayMs = millis();
+#if !SIM_MODE
+  if (!SignalKClient::ensureConnected()) {
+    AP_LOG("WiFi reconnect after display failed");
+    skLinked = false;
+  } else {
+    gDisplayWifiSession = true;
+  }
+#endif
+  sessionDisplayInProgress = false;
+}
+
+void AutopilotWatchy::maybeFlushPendingSessionDisplay() {
+  if (!pendingSessionDisplay || sessionDisplayInProgress) {
+    return;
+  }
+  if ((long)(millis() - lastBatchOkMs) < BATCH_DISPLAY_IDLE_MS) {
+    return;
+  }
+  sessionDisplayAfterBatch();
+}
+
+void AutopilotWatchy::finishSessionWithDisplay() {
+#if !SIM_MODE
+  if (pendingSessionDisplay) {
+    sessionDisplayAfterBatch();
+  }
+  if (sessionLastDisplayMs == 0 ||
+      (long)(millis() - sessionLastDisplayMs) > 2000) {
+    syncLiveDataBeforeDisplay();
+    refreshDisplaySafe();
+  }
+#else
+  refreshDisplaySafe();
+#endif
+}
+
 void AutopilotWatchy::runActiveSession() {
   AP_LOG("session start %ds", ACTIVE_SESSION_MS / 1000);
+  detachInterrupt(digitalPinToInterrupt(UP_BTN_PIN));
+  detachInterrupt(digitalPinToInterrupt(DOWN_BTN_PIN));
+  activeSession = true;
+  sessionDisplayInProgress = false;
+  sessionLastDisplayMs = 0;
+  gDisplayWifiSession = true;
+  SignalKClient::setSessionMode(true);
+
   unsigned long sessionEnd = millis() + ACTIVE_SESSION_MS;
-  bool partial = true;
+
+  RTC.read(currentTime);
+  uint8_t lastClockMinute = currentTime.Minute;
 
   while ((long)(sessionEnd - millis()) > 0) {
+    RTC.read(currentTime);
+    if (currentTime.Minute != lastClockMinute) {
+      lastClockMinute = currentTime.Minute;
+      AP_LOG("clock tick %02d:%02d", currentTime.Hour, currentTime.Minute);
+    }
+
     uint64_t remaining = sessionEnd - millis();
-    uint32_t slice = remaining > 200 ? 200 : (uint32_t)remaining;
+    uint32_t slice = remaining > 50 ? 50 : (uint32_t)remaining;
     uint64_t btn = pollButtonDown(slice);
 
     if (btn == 0) {
+      maybeFlushPendingSessionDisplay();
       continue;
     }
     if (btn == AP_BACK_BTN_MASK) {
@@ -275,15 +685,27 @@ void AutopilotWatchy::runActiveSession() {
       break;
     }
 
+    if (btn == AP_UP_BTN_MASK || btn == AP_DOWN_BTN_MASK) {
+      handleSessionHeadingPress(btn);
+      sessionEnd = millis() + ACTIVE_SESSION_MS;
+      continue;
+    }
+
     ApCommand cmd = resolveCommand(btn);
     if (cmd != ApCommand::None) {
-      executeCommand(cmd);
-      showWatchFace(partial);
-      partial = true;
+      executeSessionCommand(cmd);
       sessionEnd = millis() + ACTIVE_SESSION_MS;
     }
   }
+
+  if (pendingSessionDisplay) {
+    sessionDisplayAfterBatch();
+  }
+
   AP_LOG("session end");
+  gDisplayWifiSession = false;
+  SignalKClient::setSessionMode(false);
+  activeSession = false;
 }
 
 ApCommand AutopilotWatchy::resolveCommand(uint64_t wakeupBit) {
@@ -316,6 +738,23 @@ void AutopilotWatchy::vibeDouble() {
   vibePulse(VIB_DOUBLE_MS);
 }
 
+void AutopilotWatchy::vibeForDelta(int delta) {
+  int n = delta < 0 ? -delta : delta;
+  if (n <= 1) {
+    vibeSingle();
+    return;
+  }
+  if (n > 5) {
+    n = 5;
+  }
+  for (int i = 0; i < n; i++) {
+    vibePulse(120);
+    if (i + 1 < n) {
+      delay(55);
+    }
+  }
+}
+
 bool AutopilotWatchy::isDoubleAction(ApCommand cmd) const {
   switch (cmd) {
   case ApCommand::AdjustPlus10:
@@ -328,6 +767,89 @@ bool AutopilotWatchy::isDoubleAction(ApCommand cmd) const {
   default:
     return false;
   }
+}
+
+void AutopilotWatchy::applySkSnapshot(const SkAutopilotSnapshot &snap) {
+  if (!snap.ok) {
+    return;
+  }
+
+  strncpy(profileLabel, snap.profileLabel, sizeof(profileLabel) - 1);
+  profileLabel[sizeof(profileLabel) - 1] = '\0';
+
+  if (strcmp(snap.state, "standby") == 0) {
+    apState = ApDisplayState::Standby;
+  } else if (strcmp(snap.state, "auto") == 0) {
+    apState = ApDisplayState::Auto;
+    targetValid = true;
+  } else if (strcmp(snap.state, "wind") == 0) {
+    apState = ApDisplayState::Wind;
+    targetValid = false;
+  } else {
+    apState = ApDisplayState::Unknown;
+  }
+
+  if (snap.targetValid && apState != ApDisplayState::Wind) {
+    targetHeadingDeg = apNormalizeHeadingDeg(snap.targetHeadingDeg);
+    targetValid = true;
+  } else {
+    targetValid = false;
+  }
+}
+
+bool AutopilotWatchy::refreshFromSignalK() {
+  SkAutopilotSnapshot snap;
+  if (!SignalKClient::readAutopilot(snap)) {
+    skLinked = false;
+    AP_LOG("SK read failed");
+    return false;
+  }
+  applySkSnapshot(snap);
+  skLinked = true;
+  return true;
+}
+
+bool AutopilotWatchy::putCommand(ApCommand cmd) {
+  switch (cmd) {
+  case ApCommand::AdjustPlus1:
+  case ApCommand::AdjustMinus1:
+  case ApCommand::AdjustPlus10:
+  case ApCommand::AdjustMinus10:
+    if (apState == ApDisplayState::Standby) {
+      AP_LOG("ignore heading adjust in STANDBY");
+      return false;
+    }
+    break;
+  default:
+    break;
+  }
+
+  switch (cmd) {
+  case ApCommand::AdjustPlus1:
+    return SignalKClient::putAdjustHeading(1);
+  case ApCommand::AdjustMinus1:
+    return SignalKClient::putAdjustHeading(-1);
+  case ApCommand::AdjustPlus10:
+    return SignalKClient::putAdjustHeading(10);
+  case ApCommand::AdjustMinus10:
+    return SignalKClient::putAdjustHeading(-10);
+  case ApCommand::SetAuto:
+    return SignalKClient::putAutopilotState("auto");
+  case ApCommand::SetStandby:
+    return SignalKClient::putAutopilotState("standby");
+  case ApCommand::SetWind:
+    return SignalKClient::putAutopilotState("wind");
+  default:
+    return false;
+  }
+}
+
+bool AutopilotWatchy::liveApply(ApCommand cmd) {
+  const bool ok = putCommand(cmd);
+  if (ok && !refreshFromSignalK()) {
+    AP_LOG("SK read after PUT failed");
+  }
+  return ok;
 }
 
 void AutopilotWatchy::simApply(ApCommand cmd) {
@@ -374,11 +896,7 @@ void AutopilotWatchy::simApply(ApCommand cmd) {
   }
 
   if (targetHeadingDeg >= 360.0f || targetHeadingDeg < 0.0f) {
-    int wrapped = (int)roundf(targetHeadingDeg) % 360;
-    if (wrapped < 0) {
-      wrapped += 360;
-    }
-    targetHeadingDeg = (float)wrapped;
+    targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
   }
 }
 
@@ -414,22 +932,98 @@ void AutopilotWatchy::executeCommand(ApCommand cmd) {
     break;
   }
 
-  Serial.printf("[AP] command %s\n", name);
+  AP_LOG("command %s", name);
 
 #if SIM_MODE
   simApply(cmd);
-#else
-  // Milestone 2+: WiFi wake, WebSocket PUT, wait for COMPLETED
-#endif
-
   logState("after");
-
   if (longVibeNext || isDoubleAction(cmd)) {
     vibeDouble();
   } else {
     vibeSingle();
   }
   longVibeNext = false;
+#else
+  const bool ok = liveApply(cmd);
+  logState("after");
+  if (ok) {
+    if (longVibeNext || isDoubleAction(cmd)) {
+      vibeDouble();
+    } else {
+      vibeSingle();
+    }
+  } else {
+    AP_LOG("command failed — no vibration");
+  }
+  longVibeNext = false;
+#endif
+}
+
+void AutopilotWatchy::executeSessionCommand(ApCommand cmd) {
+  if (cmd == ApCommand::None) {
+    return;
+  }
+
+  const char *name = "?";
+  switch (cmd) {
+  case ApCommand::AdjustPlus1:
+    name = "+1";
+    break;
+  case ApCommand::AdjustMinus1:
+    name = "-1";
+    break;
+  case ApCommand::AdjustPlus10:
+    name = "+10";
+    break;
+  case ApCommand::AdjustMinus10:
+    name = "-10";
+    break;
+  case ApCommand::SetAuto:
+    name = "AUTO";
+    break;
+  case ApCommand::SetStandby:
+    name = "STANDBY";
+    break;
+  case ApCommand::SetWind:
+    name = "WIND";
+    break;
+  default:
+    break;
+  }
+
+  AP_LOG("command %s", name);
+
+#if SIM_MODE
+  simApply(cmd);
+  logState("after");
+  if (longVibeNext || isDoubleAction(cmd)) {
+    vibeDouble();
+  } else {
+    vibeSingle();
+  }
+  longVibeNext = false;
+  sessionDisplayTick(true);
+#else
+  const bool ok = putCommand(cmd);
+  if (ok) {
+    if (!refreshFromSignalK()) {
+      AP_LOG("SK read after PUT failed");
+    }
+    logState("after");
+    if (longVibeNext || isDoubleAction(cmd)) {
+      vibeDouble();
+    } else {
+      vibeSingle();
+    }
+    pendingSessionDisplay = true;
+    lastBatchOkMs = millis();
+  } else {
+    AP_LOG("command failed — no vibration");
+    refreshFromSignalK();
+    logState("after");
+  }
+  longVibeNext = false;
+#endif
 }
 
 void AutopilotWatchy::handleButtonPress() {
@@ -442,16 +1036,84 @@ void AutopilotWatchy::handleButtonPress() {
     return;
   }
 
-  AP_LOG("wake btn=%s mask=0x%llx", btnName(wakeupBit),
-         (unsigned long long)wakeupBit);
+  AP_LOG("wake btn=%s mask=0x%lx", btnName(wakeupBit),
+         (unsigned long)wakeupBit);
 
-  ApCommand cmd = resolveCommand(wakeupBit);
-  executeCommand(cmd);
-
-  if (cmd != ApCommand::None) {
-    showWatchFace(false);
-    runActiveSession();
-  } else {
-    AP_LOG("no command");
+  int wakeHeadingDelta = 0;
+  if (wakeupBit == AP_UP_BTN_MASK || wakeupBit == AP_DOWN_BTN_MASK) {
+    wakeHeadingDelta = consumePendingWakeHeadingDelta();
+    if (abs(wakeHeadingDelta) != 10) {
+      if (wakeHeadingDelta == 0) {
+        wakeHeadingDelta = (wakeupBit == AP_UP_BTN_MASK) ? 1 : -1;
+      }
+      // Extra window after display init — catches 2nd click during slow boot.
+      wakeHeadingDelta = collectWakeHeadingDeltaImpl(wakeupBit, wakeHeadingDelta,
+                                                     BTN_WAKE_EXTEND_MS);
+    }
+    AP_LOG("wake clicks -> %s%d", wakeHeadingDelta > 0 ? "+" : "",
+           wakeHeadingDelta);
   }
+
+  if (wakeupBit == AP_UP_BTN_MASK || wakeupBit == AP_DOWN_BTN_MASK) {
+#if !SIM_MODE
+    if (!SignalKClient::ensureConnected()) {
+      skLinked = false;
+      profileLabel[0] = '\0';
+      AP_LOG("WiFi connect failed");
+    } else {
+      refreshFromSignalK();
+    }
+#endif
+    if (wakeHeadingDelta != 0) {
+      executeSessionHeadingDelta(wakeHeadingDelta);
+    }
+    waitButtonsReleased();
+    runActiveSession();
+    finishSessionWithDisplay();
+    return;
+  }
+
+  if (wakeupBit == AP_MENU_BTN_MASK) {
+    ApCommand cmd = resolveSelect();
+    waitButtonsReleased();
+
+    if (cmd == ApCommand::None) {
+      AP_LOG("wake screen");
+#if !SIM_MODE
+      syncLiveDataBeforeDisplay();
+#endif
+      refreshDisplaySafe();
+      deepSleep();
+      return;
+    }
+
+#if !SIM_MODE
+    if (!SignalKClient::ensureConnected()) {
+      skLinked = false;
+      profileLabel[0] = '\0';
+      AP_LOG("WiFi connect failed");
+    } else {
+      refreshFromSignalK();
+    }
+#endif
+    executeCommand(cmd);
+    runActiveSession();
+    finishSessionWithDisplay();
+    return;
+  }
+
+  AP_LOG("no command");
 }
+
+#if AP_DEBUG
+void apLogPrint(const char *fmt, ...) {
+  tmElements_t tm;
+  Watchy::RTC.read(tm);
+  Serial.printf("%02d:%02d:%02d [AP] ", tm.Hour, tm.Minute, tm.Second);
+
+  va_list args;
+  va_start(args, fmt);
+  Serial.vprintf(fmt, args);
+  va_end(args);
+}
+#endif

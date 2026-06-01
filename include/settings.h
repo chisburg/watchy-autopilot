@@ -13,7 +13,7 @@ watchySettings settings{
     .weatherLang = "en",
     .weatherUpdateInterval = 30,
     .ntpServer = "pool.ntp.org",
-    .gmtOffset = 3600,
+    .gmtOffset = 7200,
     .vibrateOClock = false,
 };
 

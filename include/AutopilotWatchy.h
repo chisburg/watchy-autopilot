@@ -2,7 +2,9 @@
 #define AUTOPILOT_WATCHY_H
 
 #include "Watchy.h"
+#include "ap_command.h"
 #include "config.h"
+#include "signalk_client.h"
 
 enum class ApDisplayState : uint8_t {
   Standby,
@@ -12,17 +14,6 @@ enum class ApDisplayState : uint8_t {
   Unknown,
 };
 
-enum class ApCommand : uint8_t {
-  None,
-  AdjustPlus1,
-  AdjustMinus1,
-  AdjustPlus10,
-  AdjustMinus10,
-  SetAuto,
-  SetStandby,
-  SetWind,
-};
-
 class AutopilotWatchy : public Watchy {
   using Watchy::Watchy;
 
@@ -30,15 +21,50 @@ public:
   void drawWatchFace() override;
   void handleButtonPress() override;
 
+  // Call at very start of setup() before Serial/WiFi — catches fast multi-click wake.
+  static void captureWakeHeadingDeltaEarly();
+  static int consumePendingWakeHeadingDelta();
+
+  // Reset boot: WiFi + Signal K read, then full watch face.
+  void bootSyncBeforeDisplay();
+
 private:
+  static RTC_DATA_ATTR int8_t pendingWakeHeadingDelta;
   static RTC_DATA_ATTR float targetHeadingDeg;
   static RTC_DATA_ATTR ApDisplayState apState;
   static RTC_DATA_ATTR bool targetValid;
-  static RTC_DATA_ATTR   bool skLinked;
+  static RTC_DATA_ATTR bool skLinked;
+  static RTC_DATA_ATTR char profileLabel[8];
+
+  bool activeSession = false;
+  bool pendingSessionDisplay = false;
+  bool sessionDisplayInProgress = false;
+  unsigned long lastBatchOkMs = 0;
+  unsigned long sessionLastDisplayMs = 0;
 
   bool longVibeNext = false;
 
+  bool refreshFromSignalK();
+  void applySkSnapshot(const SkAutopilotSnapshot &snap);
+  bool liveApply(ApCommand cmd);
+  bool putCommand(ApCommand cmd);
   void executeCommand(ApCommand cmd);
+  void executeSessionCommand(ApCommand cmd);
+  int sessionCollectHeadingDelta(uint64_t btnMask);
+  int collectWakeHeadingDelta(uint64_t btnMask);
+  static int collectWakeHeadingDeltaImpl(uint64_t btnMask, int initialDelta = 0,
+                                         uint16_t windowMs = BTN_WAKE_BURST_MS);
+  void handleSessionHeadingPress(uint64_t btnMask);
+  bool executeSessionHeadingDelta(int delta);
+  void sessionDisplayTick(bool force = false);
+  void waitButtonsReleased();
+  void paintWatchFaceFull(bool reinitPanel);
+  void refreshDisplaySafe();
+  void syncLiveDataBeforeDisplay();
+  void syncClockFromNtp();
+  void sessionDisplayAfterBatch();
+  void maybeFlushPendingSessionDisplay();
+  void finishSessionWithDisplay();
   void runActiveSession();
   uint64_t pollButtonDown(uint32_t timeoutMs);
   ApCommand resolveCommand(uint64_t wakeupBit);
@@ -49,6 +75,7 @@ private:
   void vibePulse(uint16_t onMs);
   void vibeSingle();
   void vibeDouble();
+  void vibeForDelta(int delta);
   bool isDoubleAction(ApCommand cmd) const;
   const char *stateLabel() const;
   void drawClock();

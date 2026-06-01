@@ -15,13 +15,30 @@
 // Link: https://github.com/sqfmi/Watchy
 
 #include "Display.h"
+#include "display_session.h"
+#include "esp_sleep.h"
 
-RTC_DATA_ATTR bool displayFullInit       = true;
+RTC_DATA_ATTR bool displayFullInit = true;
+
+volatile bool gDisplayWifiSession = false;
 
 void WatchyDisplay::busyCallback(const void *) {
+  if (gDisplayWifiSession) {
+    WatchyDisplay::spinBusyCallback(nullptr);
+    return;
+  }
+
+  // Stock Watchy: light sleep until BUSY goes idle (active-high busy pin).
   gpio_wakeup_enable((gpio_num_t)DISPLAY_BUSY, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
   esp_light_sleep_start();
+}
+
+void WatchyDisplay::spinBusyCallback(const void *) {
+  while (digitalRead(DISPLAY_BUSY) == HIGH) {
+    delay(10);
+    yield();
+  }
 }
 
 WatchyDisplay::WatchyDisplay() :
@@ -36,8 +53,22 @@ WatchyDisplay::WatchyDisplay() :
 }
 
 void WatchyDisplay::initWatchy() {
-  // Watchy default initialization
   init(0, displayFullInit, 2, true);
+}
+
+void WatchyDisplay::initWatchyFull() {
+  displayFullInit = true;
+  init(0, true, 2, true);
+}
+
+void WatchyDisplay::fullRefreshSolid(uint8_t value) {
+  if (_hibernating) {
+    _reset();
+  }
+  _Init_Full();
+  writeScreenBuffer(value);
+  refresh(false);
+  writeScreenBufferAgain(value);
 }
 
 void WatchyDisplay::asyncPowerOn() {

@@ -2,35 +2,32 @@
 
 Thin wrist remote for Raymarine autopilot via Signal K on the boat Pi. The watch shows confirmed state and sends intentions only — no autopilot logic on-device.
 
-## Milestone 1 (current): SIM_MODE
+## Milestone status
 
-- UI: target heading (large), state, current HDG
-- Buttons: UP/DOWN ±1°, double ±10°, hold SELECT 1.5 s → STANDBY, double SELECT → AUTO
-- `SIM_MODE=1`: local fake state, serial logging, no WiFi/Signal K
+| Mode | Env | What |
+|------|-----|------|
+| SIM | `watchy` | UI + buttons, fake state, no network |
+| Live read | `watchy-live` | Auto WiFi profile (HOME/BOAT) + Signal K HTTP read |
 
-## Hardware / tooling (verified 2026-05-31)
+See **`CONTEXT.md`** for current status, secrets setup, and button map.
 
-| Item | Value |
-|------|-------|
-| USB serial | `/dev/cu.usbserial-56230044801` (CH340 — Watchy connected) |
-| PlatformIO | `~/.platformio/penv/bin/pio` v6.1.17 |
-| Default board | `watchy` → **SQFMI Watchy V2.0** (ESP32, 200×200 e-ink) |
-| InkWatchy Docker | `vsc-inkwatchy-master` (~2 yr old); holds serial while running |
+## Secrets (WiFi passwords)
 
-**Watchy revision:** PlatformIO target is V2.0. If you have V1/V1.5/V3, switch env in `platformio.ini` (`watchy-v10`, `watchy-v15`, `watchy-v3`). At runtime, `getBoardRevision()` can confirm after flash.
-
-**Recommendation:** Use **PlatformIO on Mac** for this project (official `sqfmi/Watchy` library). Stop the InkWatchy container before upload if the serial port is busy.
+```bash
+cp include/secrets.local.h.example include/secrets.local.h
+# Edit passwords — file is gitignored
+```
 
 ## Build & flash (Mac)
 
 ```bash
 cd watchy-autopilot
-~/.platformio/penv/bin/pio run                    # build SIM_MODE
-~/.platformio/penv/bin/pio run -t upload          # flash (stop Docker first)
-~/.platformio/penv/bin/pio device monitor         # serial log
+~/.platformio/penv/bin/pio run -e watchy              # SIM
+~/.platformio/penv/bin/pio run -e watchy-live -t upload  # live + Signal K read
+~/.platformio/penv/bin/pio device monitor
 ```
 
-Live mode (later): build with `-DSIM_MODE=0` in `platformio.ini`.
+Live mode uses env **`watchy-live`** (`SIM_MODE=0`).
 
 ## Pi: device token + WS test (M0)
 

@@ -1,4 +1,5 @@
 #include "Watchy.h"
+#include "display_session.h"
 
 #ifdef ARDUINO_ESP32S3_DEV
   Watchy32KRTC Watchy::RTC;
@@ -33,8 +34,16 @@ void Watchy::init(String datetime) {
     Wire.begin(SDA, SCL);                         // init i2c
   #endif
   RTC.init();
-  // Init the display since is almost sure we will use it
-  display.epd2.initWatchy();
+  // Autopilot: skip display init on button/RTC wake — refresh only after WiFi off.
+  if (wakeup_reason != ESP_SLEEP_WAKEUP_EXT1
+#ifdef ARDUINO_ESP32S3_DEV
+      && wakeup_reason != ESP_SLEEP_WAKEUP_TIMER
+#else
+      && wakeup_reason != ESP_SLEEP_WAKEUP_EXT0
+#endif
+  ) {
+    display.epd2.initWatchy();
+  }
 
   switch (wakeup_reason) {
   #ifdef ARDUINO_ESP32S3_DEV
@@ -45,13 +54,7 @@ void Watchy::init(String datetime) {
     RTC.read(currentTime);
     switch (guiState) {
     case WATCHFACE_STATE:
-      showWatchFace(true); // partial updates on tick
-      if (settings.vibrateOClock) {
-        if (currentTime.Minute == 0) {
-          // The RTC wakes us up once per minute
-          vibMotor(75, 4);
-        }
-      }
+      // No partial tick refresh — GDEH0154D67 ghosting freezes heading digits.
       break;
     case MAIN_MENU_STATE:
       // Return to watchface if in menu for more than one tick
@@ -87,7 +90,12 @@ void Watchy::init(String datetime) {
     gmtOffset = settings.gmtOffset;
     RTC.read(currentTime);
     RTC.read(bootTime);
-    showWatchFace(false); // full update on reset
+    if (gAutopilotBootDisplay) {
+      gAutopilotBootDisplay();
+    } else {
+      display.epd2.initWatchyFull();
+      showWatchFace(false); // full update on reset
+    }
     vibMotor(75, 4);
     // For some reason, seems to be enabled on first boot
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);

@@ -4,3 +4,6 @@
 *.bak
 *.bak-agent
 .DS_Store
+
+# Local secrets — never commit
+include/secrets.local.h

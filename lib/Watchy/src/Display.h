@@ -38,11 +38,16 @@ class WatchyDisplay : public GxEPD2_EPD
     // constructor
     WatchyDisplay();
     void initWatchy();
+    void initWatchyFull();
+    // Low-level full refresh (both RAM buffers) — bypasses GxEPD2_BW page buffer.
+    void fullRefreshSolid(uint8_t value);
     void setDarkBorder(bool darkBorder);
     void asyncPowerOn();
     void _PowerOnAsync();
     bool waitingPowerOn = false;
     static void busyCallback(const void *);
+    // Spin-wait on BUSY (active HIGH) — safe during/after WiFi, no light sleep.
+    static void spinBusyCallback(const void *);
     // methods (virtual)
     //  Support for Bitmaps (Sprites) to Controller Buffer and to Screen
     void clearScreen(uint8_t value = 0xFF); // init controller memory and screen (default white)
