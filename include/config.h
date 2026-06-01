@@ -56,7 +56,7 @@ inline float apNormalizeHeadingDeg(float deg) {
 #define WIFI_SESSION_WARM_MS 3000
 #define ACTIVE_SESSION_MS 20000
 
-// Vibration: kort = ±1, dubbel = ±10 / lägesbyte
+// Vibration: kort = ±1, lång ×1/2/3 = STANDBY/AUTO/WIND, dubbel kort = ±10
 #define VIB_SINGLE_MS 200
 #define VIB_DOUBLE_MS 450
 #define VIB_GAP_MS 80

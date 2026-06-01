@@ -42,8 +42,6 @@ private:
   unsigned long lastBatchOkMs = 0;
   unsigned long sessionLastDisplayMs = 0;
 
-  bool longVibeNext = false;
-
   bool refreshFromSignalK();
   void applySkSnapshot(const SkAutopilotSnapshot &snap);
   bool liveApply(ApCommand cmd);
@@ -65,6 +63,8 @@ private:
   void sessionDisplayAfterBatch();
   void maybeFlushPendingSessionDisplay();
   void finishSessionWithDisplay();
+  void displayAfterModeChange();
+  void disconnectBeforeSleep();
   void runActiveSession();
   uint64_t pollButtonDown(uint32_t timeoutMs);
   ApCommand resolveCommand(uint64_t wakeupBit);
@@ -76,6 +76,9 @@ private:
   void vibeSingle();
   void vibeDouble();
   void vibeForDelta(int delta);
+  void vibeForMode(ApCommand cmd);
+  void vibeAfterCommand(ApCommand cmd);
+  static bool isModeCommand(ApCommand cmd);
   bool isDoubleAction(ApCommand cmd) const;
   const char *stateLabel() const;
   void drawClock();
