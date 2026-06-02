@@ -47,7 +47,7 @@ inline float apNormalizeHeadingDeg(float deg) {
 #define BTN_SELECT_MULTI_WINDOW_MS 550
 #define BTN_HOLD_STANDBY_MS 1500
 #define BTN_DEBOUNCE_MS 30
-#define BTN_SESSION_BURST_MS 1500
+// Wake only: collect multi-click before first session PUT. Session uses immediate ±1 per release.
 #define BTN_WAKE_BURST_MS 800
 #define BTN_WAKE_EXTEND_MS 500
 #define POST_PUT_COLLECT_MS 250

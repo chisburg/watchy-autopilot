@@ -384,6 +384,7 @@ ApCommand AutopilotWatchy::resolveSelect() {
 int AutopilotWatchy::sessionCollectHeadingDelta(uint64_t btnMask) {
   const bool up = (btnMask == AP_UP_BTN_MASK);
 
+  // Session: PUT on each release (C2). Hold = ±10; short press = ±1 immediately.
   unsigned long heldMs = 0;
   while (isPressed(btnMask)) {
     delay(10);
@@ -396,28 +397,7 @@ int AutopilotWatchy::sessionCollectHeadingDelta(uint64_t btnMask) {
     }
   }
 
-  int count = 1;
-  unsigned long deadline = millis() + BTN_SESSION_BURST_MS;
-  while ((long)(deadline - millis()) > 0) {
-    if (isPressed(btnMask)) {
-      heldMs = 0;
-      while (isPressed(btnMask)) {
-        delay(10);
-        heldMs += 10;
-        if (heldMs >= BTN_HOLD_ADJUST_MS) {
-          while (isPressed(btnMask)) {
-            delay(5);
-          }
-          return up ? 10 : -10;
-        }
-      }
-      count++;
-      deadline = millis() + BTN_SESSION_BURST_MS;
-    }
-    delay(5);
-  }
-
-  return up ? count : -count;
+  return up ? 1 : -1;
 }
 
 int AutopilotWatchy::collectWakeHeadingDelta(uint64_t btnMask) {
@@ -471,9 +451,9 @@ bool AutopilotWatchy::executeSessionHeadingDelta(int delta) {
 #else
   const bool ok = SignalKClient::putAdjustHeading(delta);
   if (ok) {
-    if (!refreshFromSignalK()) {
-      AP_LOG("SK read after PUT failed");
-    }
+    targetHeadingDeg += (float)delta;
+    targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
+    targetValid = true;
     if (delta <= -10 || delta >= 10) {
       vibeDouble();
     } else {
