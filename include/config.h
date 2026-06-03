@@ -37,7 +37,12 @@ inline float apNormalizeHeadingDeg(float deg) {
 // UI timing
 #define SK_LINK_TIMEOUT_MS 3000
 #define SK_PUT_TIMEOUT_MS 8000
-#define SK_PUT_SESSION_TIMEOUT_MS 3000
+// Initial PUT HTTP timeout (session = button burst; must allow 202 before poll).
+#define SK_PUT_SESSION_TIMEOUT_MS 12000
+// Poll async Signal K requests after HTTP 202 PENDING (Pi ~1 s; boat up to ~15 s).
+#define SK_PUT_POLL_INTERVAL_MS 600
+#define SK_PUT_POLL_TIMEOUT_MS 15000
+#define SK_PUT_POLL_TIMEOUT_SESSION_MS 15000
 #define WIFI_CONNECT_MS 15000
 #define WIFI_RECOVER_MS 2500
 #define WIFI_WARM_SEC 45

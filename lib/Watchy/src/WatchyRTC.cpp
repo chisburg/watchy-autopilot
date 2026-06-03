@@ -1,6 +1,6 @@
 #include "WatchyRTC.h"
 
-WatchyRTC::WatchyRTC() : rtc_ds(false) {}
+WatchyRTC::WatchyRTC() : rtc_ds(Wire) {}
 
 void WatchyRTC::init() {
   byte error;

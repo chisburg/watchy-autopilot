@@ -1235,9 +1235,11 @@ void apLogPrint(const char *fmt, ...) {
   Watchy::RTC.read(tm);
   Serial.printf("%02d:%02d:%02d [AP] ", tm.Hour, tm.Minute, tm.Second);
 
+  char buf[192];
   va_list args;
   va_start(args, fmt);
-  Serial.vprintf(fmt, args);
+  vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
+  Serial.print(buf);
 }
 #endif

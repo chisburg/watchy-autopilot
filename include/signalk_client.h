@@ -31,7 +31,7 @@ public:
   // HTTP GET vessels.self autopilot fields.
   static bool readAutopilot(SkAutopilotSnapshot &out);
 
-  // HTTP PUT — waits for COMPLETED 200. Requires SK_DEVICE_TOKEN.
+  // HTTP PUT — waits for COMPLETED 200 (polls after HTTP 202 PENDING). Requires SK_DEVICE_TOKEN.
   static bool putAdjustHeading(int degrees);
   static bool putAutopilotState(const char *state);
 

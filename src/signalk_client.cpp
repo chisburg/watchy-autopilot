@@ -22,36 +22,40 @@ int httpPutTimeoutMs() {
   return sessionMode ? SK_PUT_SESSION_TIMEOUT_MS : SK_PUT_TIMEOUT_MS;
 }
 
+int httpPutPollTimeoutMs() {
+  return sessionMode ? SK_PUT_POLL_TIMEOUT_SESSION_MS : SK_PUT_POLL_TIMEOUT_MS;
+}
+
 constexpr char AP_API_ADJUST[] =
     "/signalk/v1/api/vessels/self/steering/autopilot/actions/adjustHeading";
 constexpr char AP_API_STATE[] =
     "/signalk/v1/api/vessels/self/steering/autopilot/state";
 
-bool jsonStringValue(JSONVar node, char *buf, size_t bufLen) {
+bool jsonStringValue(const JSONVar &node, char *buf, size_t bufLen) {
   if (JSON.typeof(node) == "undefined" || bufLen == 0) {
     return false;
   }
 
   String type = JSON.typeof(node);
   if (type == "string") {
-    const char *s = (const char *)node;
-    if (s == nullptr || s[0] == '\0') {
+    const String s = (const char *)node;
+    if (s.length() == 0) {
       return false;
     }
-    strncpy(buf, s, bufLen - 1);
+    strncpy(buf, s.c_str(), bufLen - 1);
     buf[bufLen - 1] = '\0';
     return true;
   }
 
-  JSONVar wrapped = node["value"];
+  const JSONVar wrapped = node["value"];
   if (JSON.typeof(wrapped) == "undefined") {
     return false;
   }
-  const char *s = (const char *)wrapped;
-  if (s == nullptr || s[0] == '\0') {
+  const String s = (const char *)wrapped;
+  if (s.length() == 0) {
     return false;
   }
-  strncpy(buf, s, bufLen - 1);
+  strncpy(buf, s.c_str(), bufLen - 1);
   buf[bufLen - 1] = '\0';
   return true;
 }
@@ -85,22 +89,164 @@ const SkProfile *activeProfile() {
   return &SK_PROFILES[currentProfileIndex];
 }
 
-bool parseHttpPutResponse(const String &body) {
-  JSONVar doc = JSON.parse(body);
-  if (JSON.typeof(doc) == "undefined") {
-    return false;
-  }
+constexpr size_t SK_REQUEST_ID_MAX = 48;
+constexpr size_t SK_POLL_PATH_MAX = 96;
 
-  const char *state = (const char *)doc["state"];
-  if (state == nullptr || strcmp(state, "COMPLETED") != 0) {
-    return false;
-  }
+enum class PutParseResult { CompletedOk, CompletedFail, Pending, Failed, Invalid };
 
+int jsonStatusCode(JSONVar doc) {
   JSONVar code = doc["statusCode"];
-  if (JSON.typeof(code) != "undefined" && (int)code != 200) {
+  if (JSON.typeof(code) == "undefined") {
+    return -1;
+  }
+  return (int)code;
+}
+
+JSONVar requestDocRoot(JSONVar doc) {
+  if (JSON.typeof(doc) == "undefined") {
+    return JSONVar();
+  }
+  if (JSON.typeof(doc) == "array" && doc.length() > 0) {
+    return doc[0];
+  }
+  return doc;
+}
+
+PutParseResult parseRequestStateDoc(const JSONVar &docIn, int &statusCode) {
+  const JSONVar doc = requestDocRoot(docIn);
+  if (JSON.typeof(doc) == "undefined") {
+    return PutParseResult::Invalid;
+  }
+
+  const String state = (const char *)doc["state"];
+  statusCode = jsonStatusCode(doc);
+  if (state.length() == 0) {
+    return PutParseResult::Invalid;
+  }
+  if (state == "COMPLETED") {
+    return (statusCode == 200) ? PutParseResult::CompletedOk
+                               : PutParseResult::CompletedFail;
+  }
+  if (state == "PENDING") {
+    return PutParseResult::Pending;
+  }
+  if (state == "FAILED") {
+    return PutParseResult::Failed;
+  }
+  return PutParseResult::Invalid;
+}
+
+bool fillPollPath(const JSONVar &docIn, char *pollPath, size_t pollPathLen) {
+  const JSONVar doc = requestDocRoot(docIn);
+  if (JSON.typeof(doc) == "undefined" || pollPathLen == 0) {
+    return false;
+  }
+
+  const String href = (const char *)doc["href"];
+  if (href.length() > 0 && href.charAt(0) == '/') {
+    strncpy(pollPath, href.c_str(), pollPathLen - 1);
+    pollPath[pollPathLen - 1] = '\0';
+    return true;
+  }
+
+  char requestId[SK_REQUEST_ID_MAX];
+  if (!jsonStringValue(doc["requestId"], requestId, sizeof(requestId))) {
+    return false;
+  }
+  snprintf(pollPath, pollPathLen, "/signalk/v1/requests/%s", requestId);
+  return true;
+}
+
+bool logRequestMessage(const JSONVar &docIn) {
+  const JSONVar doc = requestDocRoot(docIn);
+  const String message = (const char *)doc["message"];
+  if (message.length() > 0) {
+    AP_LOG("SK message: %s", message.c_str());
+    return true;
+  }
+  return false;
+}
+
+bool httpGetPath(const SkProfile &profile, const char *apiPath, String &outBody,
+                 int timeoutMs, bool useToken) {
+  const String url = String("http://") + profile.skHost + ":" +
+                     String(profile.skPort) + apiPath;
+
+  WiFiClient client;
+  client.setTimeout(timeoutMs / 1000);
+
+  HTTPClient http;
+  http.setReuse(false);
+  http.setTimeout(timeoutMs);
+  if (!http.begin(client, url)) {
+    AP_LOG("HTTP GET begin failed");
+    return false;
+  }
+
+  http.addHeader("Connection", "close");
+  if (useToken && tokenConfigured()) {
+    http.addHeader("Authorization", String("Bearer ") + SK_DEVICE_TOKEN);
+  }
+
+  const int code = http.GET();
+  outBody = http.getString();
+  http.end();
+  client.stop();
+
+  if (code != HTTP_CODE_OK) {
+    AP_LOG("HTTP GET %s -> %d", apiPath, code);
     return false;
   }
   return true;
+}
+
+bool httpGet(const SkProfile &profile, const char *apiPath, String &outBody) {
+  return httpGetPath(profile, apiPath, outBody, SK_LINK_TIMEOUT_MS, false);
+}
+
+bool pollPendingRequest(const SkProfile &profile, const char *pollPath) {
+  const unsigned long deadline =
+      millis() + (unsigned long)httpPutPollTimeoutMs();
+  int pollNum = 0;
+
+  while ((long)(deadline - millis()) > 0) {
+    delay(SK_PUT_POLL_INTERVAL_MS);
+    pollNum++;
+
+    String body;
+    if (!httpGetPath(profile, pollPath, body, SK_LINK_TIMEOUT_MS, true)) {
+      AP_LOG("HTTP PUT poll #%d GET failed", pollNum);
+      continue;
+    }
+
+    JSONVar doc = JSON.parse(body);
+    int statusCode = -1;
+    const PutParseResult result = parseRequestStateDoc(doc, statusCode);
+
+    if (result == PutParseResult::CompletedOk) {
+      AP_LOG("HTTP PUT poll #%d COMPLETED 200", pollNum);
+      return true;
+    }
+    if (result == PutParseResult::CompletedFail) {
+      AP_LOG("HTTP PUT poll #%d COMPLETED status=%d", pollNum, statusCode);
+      logRequestMessage(doc);
+      return false;
+    }
+    if (result == PutParseResult::Failed) {
+      AP_LOG("HTTP PUT poll #%d FAILED status=%d", pollNum, statusCode);
+      logRequestMessage(doc);
+      return false;
+    }
+    if (result == PutParseResult::Pending) {
+      AP_LOG("HTTP PUT poll #%d PENDING", pollNum);
+      continue;
+    }
+
+    AP_LOG("HTTP PUT poll #%d bad body", pollNum);
+  }
+
+  AP_LOG("HTTP PUT poll timeout %s", pollPath);
+  return false;
 }
 
 bool httpPut(const SkProfile &profile, const char *apiPath,
@@ -155,50 +301,57 @@ bool httpPut(const SkProfile &profile, const char *apiPath,
       }
       continue;
     }
-    if (code != HTTP_CODE_OK) {
-      AP_LOG("HTTP PUT -> %d", code);
-      return false;
-    }
-    if (!parseHttpPutResponse(body)) {
-      AP_LOG("HTTP PUT bad response");
+
+    AP_LOG("HTTP PUT -> %d", code);
+
+    if (code != HTTP_CODE_OK && code != HTTP_CODE_ACCEPTED) {
       return false;
     }
 
-    AP_LOG("HTTP PUT COMPLETED 200");
-    wifiStale = false;
-    return true;
+    JSONVar doc = JSON.parse(body);
+    int statusCode = -1;
+    const PutParseResult result = parseRequestStateDoc(doc, statusCode);
+
+    if (result == PutParseResult::CompletedOk) {
+      AP_LOG("HTTP PUT COMPLETED 200");
+      wifiStale = false;
+      return true;
+    }
+    if (result == PutParseResult::CompletedFail) {
+      AP_LOG("HTTP PUT COMPLETED status=%d", statusCode);
+      logRequestMessage(doc);
+      return false;
+    }
+    if (result == PutParseResult::Failed) {
+      AP_LOG("HTTP PUT FAILED status=%d", statusCode);
+      logRequestMessage(doc);
+      return false;
+    }
+    if (result == PutParseResult::Pending) {
+      const JSONVar root = requestDocRoot(doc);
+      char pollPath[SK_POLL_PATH_MAX];
+      char requestId[SK_REQUEST_ID_MAX];
+      if (!fillPollPath(root, pollPath, sizeof(pollPath))) {
+        AP_LOG("HTTP PUT PENDING missing requestId/href");
+        return false;
+      }
+      if (jsonStringValue(root["requestId"], requestId, sizeof(requestId))) {
+        AP_LOG("HTTP PUT PENDING requestId=%s", requestId);
+      } else {
+        AP_LOG("HTTP PUT PENDING poll=%s", pollPath);
+      }
+      if (pollPendingRequest(profile, pollPath)) {
+        wifiStale = false;
+        return true;
+      }
+      return false;
+    }
+
+    AP_LOG("HTTP PUT bad response");
+    return false;
   }
 
   return false;
-}
-
-bool httpGet(const SkProfile &profile, const char *apiPath, String &outBody) {
-  const String url = String("http://") + profile.skHost + ":" +
-                     String(profile.skPort) + apiPath;
-
-  WiFiClient client;
-  client.setTimeout(SK_LINK_TIMEOUT_MS / 1000);
-
-  HTTPClient http;
-  http.setReuse(false);
-  http.setTimeout(SK_LINK_TIMEOUT_MS);
-  if (!http.begin(client, url)) {
-    AP_LOG("HTTP GET begin failed");
-    return false;
-  }
-
-  http.addHeader("Connection", "close");
-
-  const int code = http.GET();
-  outBody = http.getString();
-  http.end();
-  client.stop();
-
-  if (code != HTTP_CODE_OK) {
-    AP_LOG("HTTP GET %s -> %d", apiPath, code);
-    return false;
-  }
-  return true;
 }
 
 } // namespace

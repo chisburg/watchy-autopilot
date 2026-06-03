@@ -2,7 +2,7 @@
 
 Projektfil för dig och AI-assistenter. Uppdatera när milestones, miljö eller båttest ändras.
 
-**Senast:** 2026-06-02 — M5 båttest + Pi-logganalys. Rotorsak: HTTP 202/PENDING vs firmware som kräver 200/COMPLETED direkt.
+**Senast:** 2026-06-03 — M3/M4-fix: `signalk_client.cpp` pollar PENDING (HTTP 202) tills COMPLETED 200; längre session-PUT-timeout.
 
 ## Vad vi bygger
 
@@ -108,12 +108,12 @@ Hemma utan YDWG: samma **202/PENDING** på AUTO (curl 2026-06-02). Sim kan känn
 
 **±1 i STANDBY:** `COMPLETED` + **400** — förväntat; pilot måste vara i **AUTO** (eller WIND för vissa kommandon).
 
-### Firmware-fix (prioritet)
+### Firmware-fix (implementerad 2026-06-03)
 
-1. Efter PUT: om **202/PENDING** → polla `GET /signalk/v1/requests/{requestId}` tills `COMPLETED` eller timeout (≥500 ms mellan poll; timeout 8–15 s på båt).
-2. Lyckat = slutligt `COMPLETED` + `statusCode` 200 → vibration + refresh.
-3. Längre PUT-timeout i session (nu **3 s** — för kort).
-4. Bättre `[AP]`-logg: initial HTTP, requestId, poll, body vid fail.
+1. Efter PUT: **202/PENDING** → polla `href` eller `GET /signalk/v1/requests/{requestId}` var **600 ms** tills `COMPLETED` eller **15 s**.
+2. Lyckat = slutligt `COMPLETED` + `statusCode` 200 → vibration + refresh (oförändrat i `AutopilotWatchy.cpp`).
+3. Session PUT-timeout **12 s** (`SK_PUT_SESSION_TIMEOUT_MS`); poll-timeout **15 s**.
+4. `[AP]`-logg: `HTTP PUT ->` kod, `requestId`, `poll #N PENDING/COMPLETED`, `SK message` vid fail.
 
 Övrigt (senare): display efter session, batteri under WiFi, knapp-dokumentation = kod.
 
@@ -124,10 +124,10 @@ Hemma utan YDWG: samma **202/PENDING** på AUTO (curl 2026-06-02). Sim kan känn
 | M0 | Script | Token + test på Pi (`signalk-ap-wind-test.sh` / curl; `signalk-ap-test.sh` saknas ibland i tree) |
 | M1 | **Klar** | UI + knappar + SIM_MODE |
 | M2 | **Klar** | WiFi HOME/BOAT + HTTP GET autopilot |
-| M3 | **Blockerad på båt** | PUT ±1 — fungerar på Pi i AUTO; Watchy failar p.g.a. PENDING/timeout |
-| M4 | **Blockerad på båt** | PUT state — Pi SUCCESS; Watchy kräver omedelbar COMPLETED |
-| M5 | **Testad** | Båttest 2026-06-02; Pi-loggar analyserade; fix = request-poll |
-| M6 | — | Efter poll: båt re-test med `pio monitor \| tee` + parallell Pi journalctl |
+| M3 | **Klar (kod)** | PUT ±1 — poll efter PENDING; båt re-test (M6) |
+| M4 | **Klar (kod)** | PUT state — samma poll; båt re-test (M6) |
+| M5 | **Testad** | Båttest 2026-06-02; Pi-loggar analyserade |
+| M6 | — | Flasha fix; `pio monitor \| tee` + Pi `journalctl` parallellt |
 
 ## Viktiga filer
 
@@ -137,7 +137,7 @@ Hemma utan YDWG: samma **202/PENDING** på AUTO (curl 2026-06-02). Sim kan känn
 | `src/signalk_client.cpp` | WiFi, HTTP PUT/GET, **parseHttpPutResponse** ← rotorsak |
 | `include/network_profiles.h` | HOME/BOAT SSID, host |
 | `include/secrets.local.h` | WiFi + `SK_DEVICE_TOKEN` |
-| `include/config.h` | `SK_PUT_SESSION_TIMEOUT_MS=3000`, `ACTIVE_SESSION_MS=20000` |
+| `include/config.h` | `SK_PUT_SESSION_TIMEOUT_MS=12000`, poll 15 s, `ACTIVE_SESSION_MS=20000` |
 | `lib/Watchy/src/Watchy.cpp` | Hoppar display-init på knappväckning |
 | `BRIEF.md` | API, Raymarine, N2K |
 | `scripts/flash.sh` | Bygg + flash |
@@ -150,7 +150,7 @@ Hemma utan YDWG: samma **202/PENDING** på AUTO (curl 2026-06-02). Sim kan känn
 
 ## Nästa steg
 
-1. **Agent:** implementera PENDING-poll i `signalk_client.cpp` + timeout + logg.
-2. Flasha `watchy-live`, testa hemma (curl visar 202 — ska ändå bli “lyckat” efter poll).
+1. Flasha `watchy-live`, testa hemma (curl visar 202 — ska bli “lyckat” efter poll i serial).
+2. Verifiera `[AP] HTTP PUT PENDING requestId=...` → `poll #N COMPLETED 200` + vibration.
 3. **Nästa båt:** `pio monitor | tee` + Pi `journalctl -u signalk -f`; curl AUTO på båt-WiFi med pilot AUTO; polla en requestId manuellt som referens.
 4. Verifiera display efter lyckad poll (`refreshDisplaySafe`).
