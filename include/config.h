@@ -42,12 +42,12 @@ inline float apNormalizeHeadingDeg(float deg) {
 #define WIFI_RECOVER_MS 2500
 #define WIFI_WARM_SEC 45
 
-// MENU: enkel = wake screen, dubbel = STANDBY→AUTO / AUTO↔WIND, håll = STANDBY
+// MENU: enkel = wake, dubbel = AUTO↔WIND, håll = STANDBY↔AUTO/WIND→STANDBY
 #define BTN_HOLD_ADJUST_MS 650
 #define BTN_SELECT_MULTI_WINDOW_MS 550
 #define BTN_HOLD_STANDBY_MS 1500
 #define BTN_DEBOUNCE_MS 30
-// Wake only: collect multi-click before first session PUT. Session uses immediate ±1 per release.
+#define BTN_SESSION_BURST_MS 400
 #define BTN_WAKE_BURST_MS 800
 #define BTN_WAKE_EXTEND_MS 500
 #define POST_PUT_COLLECT_MS 250
@@ -57,6 +57,7 @@ inline float apNormalizeHeadingDeg(float deg) {
 #define ACTIVE_SESSION_MS 20000
 
 // Vibration: kort = ±1, lång ×1/2/3 = STANDBY/AUTO/WIND, dubbel kort = ±10
+#define VIB_CONFIRM_DELAY_MS 100
 #define VIB_SINGLE_MS 200
 #define VIB_DOUBLE_MS 450
 #define VIB_GAP_MS 80

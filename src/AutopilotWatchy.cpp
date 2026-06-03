@@ -30,6 +30,7 @@ RTC_DATA_ATTR bool AutopilotWatchy::targetValid = true;
 RTC_DATA_ATTR bool AutopilotWatchy::skLinked = false;
 RTC_DATA_ATTR char AutopilotWatchy::profileLabel[8] = "";
 RTC_DATA_ATTR int8_t AutopilotWatchy::pendingWakeHeadingDelta = 0;
+RTC_DATA_ATTR int8_t AutopilotWatchy::pendingWakeMenuPresses = 0;
 
 namespace {
 
@@ -105,6 +106,81 @@ void AutopilotWatchy::captureWakeHeadingDeltaEarly() {
     count = 5;
   }
   pendingWakeHeadingDelta = (int8_t)(up ? count : -count);
+}
+
+void AutopilotWatchy::captureWakeMenuPressesEarly() {
+  pendingWakeMenuPresses = 0;
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) {
+    return;
+  }
+  if (esp_sleep_get_ext1_wakeup_status() != AP_MENU_BTN_MASK) {
+    return;
+  }
+
+  pinMode(MENU_BTN_PIN, INPUT);
+
+  unsigned long heldMs = 0;
+  while (digitalRead(MENU_BTN_PIN) == BTN_ACTIVE) {
+    delay(10);
+    heldMs += 10;
+    if (heldMs >= BTN_HOLD_STANDBY_MS) {
+      while (digitalRead(MENU_BTN_PIN) == BTN_ACTIVE) {
+        delay(5);
+      }
+      pendingWakeMenuPresses = -1;
+      return;
+    }
+  }
+
+  int presses = 1;
+  unsigned long deadline = millis() + BTN_WAKE_BURST_MS;
+  while ((long)(deadline - millis()) > 0) {
+    if (digitalRead(MENU_BTN_PIN) == BTN_ACTIVE) {
+      delay(BTN_DEBOUNCE_MS);
+      while (digitalRead(MENU_BTN_PIN) == BTN_ACTIVE) {
+        delay(5);
+      }
+      presses++;
+      if (presses >= 2) {
+        break;
+      }
+      deadline = millis() + BTN_SELECT_MULTI_WINDOW_MS;
+    }
+    delay(5);
+  }
+  pendingWakeMenuPresses = (int8_t)presses;
+}
+
+int AutopilotWatchy::consumePendingWakeMenuPresses() {
+  const int presses = (int)pendingWakeMenuPresses;
+  pendingWakeMenuPresses = 0;
+  return presses;
+}
+
+ApCommand AutopilotWatchy::menuCmdFromLongHold() {
+  if (apState == ApDisplayState::Standby) {
+    return ApCommand::SetAuto;
+  }
+  if (apState == ApDisplayState::Auto || apState == ApDisplayState::Wind) {
+    return ApCommand::SetStandby;
+  }
+  return ApCommand::None;
+}
+
+ApCommand AutopilotWatchy::menuCmdFromPressCount(int presses) {
+  if (presses < 0) {
+    return menuCmdFromLongHold();
+  }
+  if (presses >= 2) {
+    if (apState == ApDisplayState::Auto) {
+      return ApCommand::SetWind;
+    }
+    if (apState == ApDisplayState::Wind) {
+      return ApCommand::SetAuto;
+    }
+    return ApCommand::None;
+  }
+  return ApCommand::None;
 }
 
 int AutopilotWatchy::consumePendingWakeHeadingDelta() {
@@ -360,31 +436,18 @@ ApCommand AutopilotWatchy::resolveSelect() {
       while (isPressed(AP_MENU_BTN_MASK)) {
         delay(5);
       }
-      return ApCommand::SetStandby;
+      return menuCmdFromLongHold();
     }
   }
 
-  int presses = countPresses(AP_MENU_BTN_MASK, BTN_SELECT_MULTI_WINDOW_MS, 2);
-  if (presses >= 2) {
-    if (apState == ApDisplayState::Standby) {
-      return ApCommand::SetAuto;
-    }
-    if (apState == ApDisplayState::Auto) {
-      return ApCommand::SetWind;
-    }
-    if (apState == ApDisplayState::Wind) {
-      return ApCommand::SetAuto;
-    }
-    return ApCommand::SetAuto;
-  }
-  // Single click: wake screen only (no autopilot command).
-  return ApCommand::None;
+  const int presses =
+      countPresses(AP_MENU_BTN_MASK, BTN_SELECT_MULTI_WINDOW_MS, 2);
+  return menuCmdFromPressCount(presses);
 }
 
 int AutopilotWatchy::sessionCollectHeadingDelta(uint64_t btnMask) {
   const bool up = (btnMask == AP_UP_BTN_MASK);
 
-  // Session: PUT on each release (C2). Hold = ±10; short press = ±1 immediately.
   unsigned long heldMs = 0;
   while (isPressed(btnMask)) {
     delay(10);
@@ -397,7 +460,28 @@ int AutopilotWatchy::sessionCollectHeadingDelta(uint64_t btnMask) {
     }
   }
 
-  return up ? 1 : -1;
+  int count = 1;
+  unsigned long deadline = millis() + BTN_SESSION_BURST_MS;
+  while ((long)(deadline - millis()) > 0) {
+    if (isPressed(btnMask)) {
+      heldMs = 0;
+      while (isPressed(btnMask)) {
+        delay(10);
+        heldMs += 10;
+        if (heldMs >= BTN_HOLD_ADJUST_MS) {
+          while (isPressed(btnMask)) {
+            delay(5);
+          }
+          return up ? 10 : -10;
+        }
+      }
+      count++;
+      deadline = millis() + BTN_SESSION_BURST_MS;
+    }
+    delay(5);
+  }
+
+  return up ? count : -count;
 }
 
 int AutopilotWatchy::collectWakeHeadingDelta(uint64_t btnMask) {
@@ -442,6 +526,7 @@ bool AutopilotWatchy::executeSessionHeadingDelta(int delta) {
   targetHeadingDeg += (float)delta;
   targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
   logState("after");
+  vibeConfirmPause();
   if (delta <= -10 || delta >= 10) {
     vibeDouble();
   } else {
@@ -454,6 +539,7 @@ bool AutopilotWatchy::executeSessionHeadingDelta(int delta) {
     targetHeadingDeg += (float)delta;
     targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
     targetValid = true;
+    vibeConfirmPause();
     if (delta <= -10 || delta >= 10) {
       vibeDouble();
     } else {
@@ -727,6 +813,10 @@ void AutopilotWatchy::vibePulse(uint16_t onMs) {
   digitalWrite(VIB_MOTOR_PIN, LOW);
 }
 
+void AutopilotWatchy::vibeConfirmPause() {
+  delay(VIB_CONFIRM_DELAY_MS);
+}
+
 void AutopilotWatchy::vibeSingle() {
   vibePulse(VIB_SINGLE_MS);
 }
@@ -783,6 +873,7 @@ bool AutopilotWatchy::isModeCommand(ApCommand cmd) {
 }
 
 void AutopilotWatchy::vibeAfterCommand(ApCommand cmd) {
+  vibeConfirmPause();
   if (isModeCommand(cmd)) {
     vibeForMode(cmd);
   } else if (isDoubleAction(cmd)) {
@@ -1103,7 +1194,9 @@ void AutopilotWatchy::handleButtonPress() {
   }
 
   if (wakeupBit == AP_MENU_BTN_MASK) {
-    ApCommand cmd = resolveSelect();
+    const int menuPresses = consumePendingWakeMenuPresses();
+    ApCommand cmd = menuPresses != 0 ? menuCmdFromPressCount(menuPresses)
+                                     : resolveSelect();
     waitButtonsReleased();
 
     if (cmd == ApCommand::None) {

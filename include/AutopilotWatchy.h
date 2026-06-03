@@ -24,12 +24,17 @@ public:
   // Call at very start of setup() before Serial/WiFi — catches fast multi-click wake.
   static void captureWakeHeadingDeltaEarly();
   static int consumePendingWakeHeadingDelta();
+  static void captureWakeMenuPressesEarly();
+  static int consumePendingWakeMenuPresses();
+  static ApCommand menuCmdFromLongHold();
+  static ApCommand menuCmdFromPressCount(int presses);
 
   // Reset boot: WiFi + Signal K read, then full watch face.
   void bootSyncBeforeDisplay();
 
 private:
   static RTC_DATA_ATTR int8_t pendingWakeHeadingDelta;
+  static RTC_DATA_ATTR int8_t pendingWakeMenuPresses;
   static RTC_DATA_ATTR float targetHeadingDeg;
   static RTC_DATA_ATTR ApDisplayState apState;
   static RTC_DATA_ATTR bool targetValid;
@@ -73,6 +78,7 @@ private:
   int countPresses(uint64_t btnMask, uint16_t windowMs, uint8_t maxPresses = 255);
   bool isPressed(uint64_t btnMask);
   void vibePulse(uint16_t onMs);
+  void vibeConfirmPause();
   void vibeSingle();
   void vibeDouble();
   void vibeForDelta(int delta);

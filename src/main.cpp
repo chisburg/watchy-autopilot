@@ -13,7 +13,10 @@ static void autopilotBootDisplay() { watchy.bootSyncBeforeDisplay(); }
 #endif
 
 // Earliest hook after deep sleep — before setup(), display init, and Serial.
-void initVariant() { AutopilotWatchy::captureWakeHeadingDeltaEarly(); }
+void initVariant() {
+  AutopilotWatchy::captureWakeHeadingDeltaEarly();
+  AutopilotWatchy::captureWakeMenuPressesEarly();
+}
 
 void setup() {
   Serial.begin(115200);
