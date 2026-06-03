@@ -1,8 +1,8 @@
 #include "signalk_client.h"
 
+#include "ap_power.h"
 #include "config.h"
 
-#include <Arduino_JSON.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -31,55 +31,81 @@ constexpr char AP_API_ADJUST[] =
 constexpr char AP_API_STATE[] =
     "/signalk/v1/api/vessels/self/steering/autopilot/state";
 
-bool jsonStringValue(const JSONVar &node, char *buf, size_t bufLen) {
-  if (JSON.typeof(node) == "undefined" || bufLen == 0) {
-    return false;
-  }
-
-  String type = JSON.typeof(node);
-  if (type == "string") {
-    const String s = (const char *)node;
-    if (s.length() == 0) {
-      return false;
-    }
-    strncpy(buf, s.c_str(), bufLen - 1);
-    buf[bufLen - 1] = '\0';
-    return true;
-  }
-
-  const JSONVar wrapped = node["value"];
-  if (JSON.typeof(wrapped) == "undefined") {
-    return false;
-  }
-  const String s = (const char *)wrapped;
-  if (s.length() == 0) {
-    return false;
-  }
-  strncpy(buf, s.c_str(), bufLen - 1);
-  buf[bufLen - 1] = '\0';
-  return true;
-}
-
-bool jsonNumberValue(JSONVar node, double &out) {
-  if (JSON.typeof(node) == "undefined") {
-    return false;
-  }
-
-  String type = JSON.typeof(node);
-  if (type == "number" || type == "integer") {
-    out = (double)node;
-    return true;
-  }
-
-  JSONVar wrapped = node["value"];
-  if (JSON.typeof(wrapped) == "undefined") {
-    return false;
-  }
-  out = (double)wrapped;
-  return true;
-}
-
 bool tokenConfigured() { return SK_DEVICE_TOKEN[0] != '\0'; }
+
+// Signal K v1 API: find "key":{..."value":X...} and read string value (no JSON library).
+bool extractSkObjectStringValue(const char *body, const char *objectKey, char *out,
+                                size_t outLen) {
+  if (!body || !objectKey || !out || outLen == 0) {
+    return false;
+  }
+  char needle[48];
+  snprintf(needle, sizeof(needle), "\"%s\":", objectKey);
+  const char *obj = strstr(body, needle);
+  if (!obj) {
+    return false;
+  }
+
+  const char *valueKey = strstr(obj, "\"value\"");
+  if (!valueKey) {
+    return false;
+  }
+  const char *colon = strchr(valueKey, ':');
+  if (!colon) {
+    return false;
+  }
+  const char *p = colon + 1;
+  while (*p == ' ' || *p == '\t') {
+    p++;
+  }
+  if (*p != '"') {
+    return false;
+  }
+  p++;
+  const char *end = strchr(p, '"');
+  if (!end) {
+    return false;
+  }
+  const size_t len = (size_t)(end - p);
+  if (len == 0 || len >= outLen) {
+    return false;
+  }
+  memcpy(out, p, len);
+  out[len] = '\0';
+  return true;
+}
+
+bool extractSkObjectNumberValue(const char *body, const char *objectKey, double &out) {
+  if (!body || !objectKey) {
+    return false;
+  }
+  char needle[48];
+  snprintf(needle, sizeof(needle), "\"%s\":", objectKey);
+  const char *obj = strstr(body, needle);
+  if (!obj) {
+    return false;
+  }
+
+  const char *valueKey = strstr(obj, "\"value\"");
+  if (!valueKey) {
+    return false;
+  }
+  const char *colon = strchr(valueKey, ':');
+  if (!colon) {
+    return false;
+  }
+  const char *p = colon + 1;
+  while (*p == ' ' || *p == '\t') {
+    p++;
+  }
+  char *end = nullptr;
+  const double v = strtod(p, &end);
+  if (end == p) {
+    return false;
+  }
+  out = v;
+  return true;
+}
 
 const SkProfile *activeProfile() {
   if (currentProfileIndex < 0 ||
@@ -94,81 +120,129 @@ constexpr size_t SK_POLL_PATH_MAX = 96;
 
 enum class PutParseResult { CompletedOk, CompletedFail, Pending, Failed, Invalid };
 
-int jsonStatusCode(JSONVar doc) {
-  JSONVar code = doc["statusCode"];
-  if (JSON.typeof(code) == "undefined") {
-    return -1;
+// Copy HTTP body into stack buffer and release heap String before parsing (ESP32 heap).
+void captureHttpBody(HTTPClient &http, char *buf, size_t bufLen, bool *truncated) {
+  if (bufLen == 0) {
+    return;
   }
-  return (int)code;
+  buf[0] = '\0';
+  if (truncated) {
+    *truncated = false;
+  }
+  String tmp = http.getString();
+  const size_t rawLen = tmp.length();
+  const size_t n = rawLen < bufLen - 1 ? rawLen : bufLen - 1;
+  if (n > 0) {
+    memcpy(buf, tmp.c_str(), n);
+    buf[n] = '\0';
+  }
+  if (truncated && rawLen >= bufLen - 1) {
+    *truncated = true;
+  }
+  tmp = String();
 }
 
-JSONVar requestDocRoot(JSONVar doc) {
-  if (JSON.typeof(doc) == "undefined") {
-    return JSONVar();
+bool extractJsonStringField(const char *body, const char *key, char *out,
+                            size_t outLen) {
+  if (!body || !key || !out || outLen == 0) {
+    return false;
   }
-  if (JSON.typeof(doc) == "array" && doc.length() > 0) {
-    return doc[0];
+  char needle[32];
+  snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+  const char *start = strstr(body, needle);
+  if (!start) {
+    return false;
   }
-  return doc;
+  start += strlen(needle);
+  const char *end = strchr(start, '"');
+  if (!end) {
+    return false;
+  }
+  const size_t len = (size_t)(end - start);
+  if (len == 0 || len >= outLen) {
+    return false;
+  }
+  memcpy(out, start, len);
+  out[len] = '\0';
+  return true;
 }
 
-PutParseResult parseRequestStateDoc(const JSONVar &docIn, int &statusCode) {
-  const JSONVar doc = requestDocRoot(docIn);
-  if (JSON.typeof(doc) == "undefined") {
-    return PutParseResult::Invalid;
+bool extractJsonIntField(const char *body, const char *key, int &out) {
+  if (!body || !key) {
+    return false;
   }
+  char needle[32];
+  snprintf(needle, sizeof(needle), "\"%s\":", key);
+  const char *start = strstr(body, needle);
+  if (!start) {
+    return false;
+  }
+  start += strlen(needle);
+  out = atoi(start);
+  return true;
+}
 
-  const String state = (const char *)doc["state"];
-  statusCode = jsonStatusCode(doc);
-  if (state.length() == 0) {
+PutParseResult parseBodyRequestState(const char *body, int &statusCode) {
+  statusCode = -1;
+  if (!body || body[0] == '\0') {
     return PutParseResult::Invalid;
   }
-  if (state == "COMPLETED") {
+  extractJsonIntField(body, "statusCode", statusCode);
+
+  if (strstr(body, "\"state\":\"COMPLETED\"") != nullptr) {
     return (statusCode == 200) ? PutParseResult::CompletedOk
                                : PutParseResult::CompletedFail;
   }
-  if (state == "PENDING") {
+  if (strstr(body, "\"state\":\"PENDING\"") != nullptr) {
     return PutParseResult::Pending;
   }
-  if (state == "FAILED") {
+  if (strstr(body, "\"state\":\"FAILED\"") != nullptr) {
     return PutParseResult::Failed;
   }
   return PutParseResult::Invalid;
 }
 
-bool fillPollPath(const JSONVar &docIn, char *pollPath, size_t pollPathLen) {
-  const JSONVar doc = requestDocRoot(docIn);
-  if (JSON.typeof(doc) == "undefined" || pollPathLen == 0) {
+bool fillPollPathFromBody(const char *body, char *pollPath, size_t pollPathLen) {
+  if (!body || pollPathLen == 0) {
     return false;
   }
 
-  const String href = (const char *)doc["href"];
-  if (href.length() > 0 && href.charAt(0) == '/') {
-    strncpy(pollPath, href.c_str(), pollPathLen - 1);
-    pollPath[pollPathLen - 1] = '\0';
-    return true;
+  char href[SK_POLL_PATH_MAX];
+  if (extractJsonStringField(body, "href", href, sizeof(href))) {
+    const char *path = href;
+    if (strncmp(href, "http://", 7) == 0 || strncmp(href, "https://", 8) == 0) {
+      const char *schemeEnd = strstr(href, "://");
+      if (schemeEnd) {
+        path = strchr(schemeEnd + 3, '/');
+        if (!path) {
+          path = nullptr;
+        }
+      }
+    }
+    if (path && path[0] == '/') {
+      strncpy(pollPath, path, pollPathLen - 1);
+      pollPath[pollPathLen - 1] = '\0';
+      return true;
+    }
   }
 
   char requestId[SK_REQUEST_ID_MAX];
-  if (!jsonStringValue(doc["requestId"], requestId, sizeof(requestId))) {
+  if (!extractJsonStringField(body, "requestId", requestId, sizeof(requestId))) {
     return false;
   }
   snprintf(pollPath, pollPathLen, "/signalk/v1/requests/%s", requestId);
   return true;
 }
 
-bool logRequestMessage(const JSONVar &docIn) {
-  const JSONVar doc = requestDocRoot(docIn);
-  const String message = (const char *)doc["message"];
-  if (message.length() > 0) {
-    AP_LOG("SK message: %s", message.c_str());
-    return true;
+void logRequestMessageFromBody(const char *body) {
+  char message[96];
+  if (extractJsonStringField(body, "message", message, sizeof(message))) {
+    AP_LOG("SK message: %s", message);
   }
-  return false;
 }
 
-bool httpGetPath(const SkProfile &profile, const char *apiPath, String &outBody,
-                 int timeoutMs, bool useToken) {
+bool httpGetPath(const SkProfile &profile, const char *apiPath, char *outBody,
+                 size_t outBodyLen, int timeoutMs, bool useToken) {
   const String url = String("http://") + profile.skHost + ":" +
                      String(profile.skPort) + apiPath;
 
@@ -189,7 +263,13 @@ bool httpGetPath(const SkProfile &profile, const char *apiPath, String &outBody,
   }
 
   const int code = http.GET();
-  outBody = http.getString();
+  if (outBody && outBodyLen > 0) {
+    bool truncated = false;
+    captureHttpBody(http, outBody, outBodyLen, &truncated);
+    if (truncated) {
+      AP_LOG("HTTP GET %s body truncated (max %u)", apiPath, (unsigned)outBodyLen);
+    }
+  }
   http.end();
   client.stop();
 
@@ -197,11 +277,7 @@ bool httpGetPath(const SkProfile &profile, const char *apiPath, String &outBody,
     AP_LOG("HTTP GET %s -> %d", apiPath, code);
     return false;
   }
-  return true;
-}
-
-bool httpGet(const SkProfile &profile, const char *apiPath, String &outBody) {
-  return httpGetPath(profile, apiPath, outBody, SK_LINK_TIMEOUT_MS, false);
+  return outBody && outBody[0] != '\0';
 }
 
 bool pollPendingRequest(const SkProfile &profile, const char *pollPath) {
@@ -213,15 +289,15 @@ bool pollPendingRequest(const SkProfile &profile, const char *pollPath) {
     delay(SK_PUT_POLL_INTERVAL_MS);
     pollNum++;
 
-    String body;
-    if (!httpGetPath(profile, pollPath, body, SK_LINK_TIMEOUT_MS, true)) {
+    char body[SK_HTTP_BODY_MAX];
+    if (!httpGetPath(profile, pollPath, body, sizeof(body), SK_LINK_TIMEOUT_MS,
+                     true)) {
       AP_LOG("HTTP PUT poll #%d GET failed", pollNum);
       continue;
     }
 
-    JSONVar doc = JSON.parse(body);
     int statusCode = -1;
-    const PutParseResult result = parseRequestStateDoc(doc, statusCode);
+    const PutParseResult result = parseBodyRequestState(body, statusCode);
 
     if (result == PutParseResult::CompletedOk) {
       AP_LOG("HTTP PUT poll #%d COMPLETED 200", pollNum);
@@ -229,12 +305,12 @@ bool pollPendingRequest(const SkProfile &profile, const char *pollPath) {
     }
     if (result == PutParseResult::CompletedFail) {
       AP_LOG("HTTP PUT poll #%d COMPLETED status=%d", pollNum, statusCode);
-      logRequestMessage(doc);
+      logRequestMessageFromBody(body);
       return false;
     }
     if (result == PutParseResult::Failed) {
       AP_LOG("HTTP PUT poll #%d FAILED status=%d", pollNum, statusCode);
-      logRequestMessage(doc);
+      logRequestMessageFromBody(body);
       return false;
     }
     if (result == PutParseResult::Pending) {
@@ -290,7 +366,8 @@ bool httpPut(const SkProfile &profile, const char *apiPath,
 
     AP_LOG("HTTP PUT %s", apiPath);
     const int code = http.PUT(jsonBody);
-    const String body = http.getString();
+    char body[SK_HTTP_BODY_MAX];
+    captureHttpBody(http, body, sizeof(body), nullptr);
     http.end();
     client.stop();
 
@@ -308,46 +385,49 @@ bool httpPut(const SkProfile &profile, const char *apiPath,
       return false;
     }
 
-    JSONVar doc = JSON.parse(body);
     int statusCode = -1;
-    const PutParseResult result = parseRequestStateDoc(doc, statusCode);
+    const PutParseResult result = parseBodyRequestState(body, statusCode);
 
     if (result == PutParseResult::CompletedOk) {
       AP_LOG("HTTP PUT COMPLETED 200");
+      apLogPower("put ok");
       wifiStale = false;
       return true;
     }
     if (result == PutParseResult::CompletedFail) {
       AP_LOG("HTTP PUT COMPLETED status=%d", statusCode);
-      logRequestMessage(doc);
+      logRequestMessageFromBody(body);
       return false;
     }
     if (result == PutParseResult::Failed) {
       AP_LOG("HTTP PUT FAILED status=%d", statusCode);
-      logRequestMessage(doc);
+      logRequestMessageFromBody(body);
       return false;
     }
     if (result == PutParseResult::Pending) {
-      const JSONVar root = requestDocRoot(doc);
       char pollPath[SK_POLL_PATH_MAX];
       char requestId[SK_REQUEST_ID_MAX];
-      if (!fillPollPath(root, pollPath, sizeof(pollPath))) {
+      if (!fillPollPathFromBody(body, pollPath, sizeof(pollPath))) {
         AP_LOG("HTTP PUT PENDING missing requestId/href");
         return false;
       }
-      if (jsonStringValue(root["requestId"], requestId, sizeof(requestId))) {
+      if (extractJsonStringField(body, "requestId", requestId,
+                                 sizeof(requestId))) {
         AP_LOG("HTTP PUT PENDING requestId=%s", requestId);
       } else {
         AP_LOG("HTTP PUT PENDING poll=%s", pollPath);
       }
       if (pollPendingRequest(profile, pollPath)) {
+        apLogPower("put ok");
         wifiStale = false;
         return true;
       }
+      apLogPower("put fail");
       return false;
     }
 
     AP_LOG("HTTP PUT bad response");
+    apLogPower("put fail");
     return false;
   }
 
@@ -379,18 +459,23 @@ bool SignalKClient::connectProfile(const SkProfile &profile) {
   delay(50);
   WiFi.begin(profile.ssid, profile.password);
 
+  const unsigned long connectStart = millis();
   const unsigned long deadline = millis() + (unsigned long)WIFI_CONNECT_MS;
   while (WiFi.status() != WL_CONNECTED && (long)(deadline - millis()) > 0) {
     delay(100);
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    AP_LOG("wifi failed status=%d", WiFi.status());
+    AP_LOG("wifi failed status=%d connect_ms=%lu", WiFi.status(),
+           millis() - connectStart);
+    apLogPower("wifi fail");
     return false;
   }
 
-  AP_LOG("wifi ok ip=%s rssi=%d", WiFi.localIP().toString().c_str(),
-         WiFi.RSSI());
+  AP_LOG("wifi ok ip=%s rssi=%d connect_ms=%lu",
+         WiFi.localIP().toString().c_str(), WiFi.RSSI(),
+         millis() - connectStart);
+  apLogPower("wifi ok");
   return true;
 }
 
@@ -516,28 +601,23 @@ bool SignalKClient::fetchAutopilot(const SkProfile &profile,
                                    SkAutopilotSnapshot &out) {
   delay(50);
 
-  String body;
-  if (!httpGet(profile,
-               "/signalk/v1/api/vessels/self/steering/autopilot", body)) {
+  char body[SK_GET_BODY_MAX];
+  if (!httpGetPath(profile,
+                   "/signalk/v1/api/vessels/self/steering/autopilot", body,
+                   sizeof(body), SK_LINK_TIMEOUT_MS, false)) {
     return false;
   }
   delay(50);
 
-  JSONVar ap = JSON.parse(body);
-  if (JSON.typeof(ap) == "undefined") {
-    AP_LOG("SK JSON parse failed");
-    return false;
-  }
-
-  if (!jsonStringValue(ap["state"], out.state, sizeof(out.state))) {
+  if (!extractSkObjectStringValue(body, "state", out.state, sizeof(out.state))) {
     AP_LOG("SK missing autopilot.state");
     return false;
   }
 
   double targetRad = 0.0;
-  JSONVar targetNode = ap["target"]["headingMagnetic"];
-  if (jsonNumberValue(targetNode, targetRad)) {
-    out.targetHeadingDeg = apNormalizeHeadingDeg((float)(targetRad * 180.0 / M_PI));
+  if (extractSkObjectNumberValue(body, "headingMagnetic", targetRad)) {
+    out.targetHeadingDeg =
+        apNormalizeHeadingDeg((float)(targetRad * 180.0 / M_PI));
     out.targetValid = true;
   } else {
     out.targetValid = false;

@@ -2,7 +2,7 @@
 
 Projektfil för dig och AI-assistenter. Uppdatera när milestones, miljö eller båttest ändras.
 
-**Senast:** 2026-06-03 — M3/M4-fix: `signalk_client.cpp` pollar PENDING (HTTP 202) tills COMPLETED 200; längre session-PUT-timeout.
+**Senast:** 2026-06-03 — M3/M4-fix + heap-säker PUT/poll; `WIFI_DISPLAY_SETTLE_MS`; serial `[PWR]` (vbat, pct, rssi, connect_ms).
 
 ## Vad vi bygger
 
@@ -127,14 +127,14 @@ Hemma utan YDWG: samma **202/PENDING** på AUTO (curl 2026-06-02). Sim kan känn
 | M3 | **Klar (kod)** | PUT ±1 — poll efter PENDING; båt re-test (M6) |
 | M4 | **Klar (kod)** | PUT state — samma poll; båt re-test (M6) |
 | M5 | **Testad** | Båttest 2026-06-02; Pi-loggar analyserade |
-| M6 | — | Flasha fix; `pio monitor \| tee` + Pi `journalctl` parallellt |
+| M6 | **Flash Mac klar** | Båt/hemma serial + P70 — se checklista nedan |
 
 ## Viktiga filer
 
 | Fil | Roll |
 |-----|------|
 | `src/AutopilotWatchy.cpp` | UI, knappar, session, vibration, display-safe |
-| `src/signalk_client.cpp` | WiFi, HTTP PUT/GET, **parseHttpPutResponse** ← rotorsak |
+| `src/signalk_client.cpp` | WiFi, HTTP PUT/GET, lightweight parse PUT/poll |
 | `include/network_profiles.h` | HOME/BOAT SSID, host |
 | `include/secrets.local.h` | WiFi + `SK_DEVICE_TOKEN` |
 | `include/config.h` | `SK_PUT_SESSION_TIMEOUT_MS=12000`, poll 15 s, `ACTIVE_SESSION_MS=20000` |
@@ -148,9 +148,66 @@ Hemma utan YDWG: samma **202/PENDING** på AUTO (curl 2026-06-02). Sim kan känn
 - Watchy V2, USB `/dev/cu.usbserial-56230044801`
 - Pi: `openplotter` / `boat-pi`, repo `~/jubilon-signalk`
 
-## Nästa steg
+## Session 2026-06-03 — kodstatus (komplettering)
 
-1. Flasha `watchy-live`, testa hemma (curl visar 202 — ska bli “lyckat” efter poll i serial).
-2. Verifiera `[AP] HTTP PUT PENDING requestId=...` → `poll #N COMPLETED 200` + vibration.
-3. **Nästa båt:** `pio monitor | tee` + Pi `journalctl -u signalk -f`; curl AUTO på båt-WiFi med pilot AUTO; polla en requestId manuellt som referens.
-4. Verifiera display efter lyckad poll (`refreshDisplaySafe`).
+| Punkt | Status i repo |
+|-------|----------------|
+| `SK_PUT_SESSION_TIMEOUT_MS` | **12000** (inte 3 s — det var gammal flash) |
+| `SK_PUT_POLL_TIMEOUT_*` | **15000**; poll var **600 ms** |
+| `ACTIVE_SESSION_MS` | **20000** (> poll-timeout) |
+| `adjustHeading` ±1/±10 | Samma `httpPut()` + poll som `state` |
+| HTTP ≠ 200/202 på PUT | Avbryts **innan** parse → `put fail`, ingen success-vibration |
+| `COMPLETED` + `statusCode` 200 | Enda `put ok` / vibration |
+| `COMPLETED` + t.ex. 400 i body | `CompletedFail` → `put fail` |
+| `after state=` direkt efter PUT | **Oförändrat** — `logState("after")` + ev. `refreshFromSignalK()` kan läsa SK före N2K hunnit uppdatera; UI kan visa gammalt läge tills session end / display |
+| `fetchAutopilot` GET | Stack `SK_GET_BODY_MAX` (3072) + lightweight parse — **samma mönster som PUT** |
+| Git commit/push | **Ej gjort** i denna session |
+| Pi `createDevice` | **false** på båt — config i jubilon-signalk, inte watchy |
+
+## M6 — verifiering (efter flash)
+
+**Mac:**
+
+```bash
+cd watchy-autopilot
+./scripts/monitor.sh | tee ~/Desktop/watchy-test.log
+```
+
+**Pi (parallellt):**
+
+```bash
+journalctl -u signalk -f | grep -iE 'PUT|SUCCESS|autopilot'
+```
+
+**Ett tryck AUTO (P70 i STANDBY):**
+
+| Förväntat serial | Fel om saknas |
+|------------------|----------------|
+| `HTTP PUT -> 202` | |
+| `HTTP PUT PENDING requestId=` | Gammal binär / parse |
+| `HTTP PUT poll #N COMPLETED 200` | Poll fail |
+| `put ok` | |
+| Vibration (2× kort) | `command failed` |
+| **Ej** `CORRUPT HEAP` | Heap-fix |
+
+**Wake screen (mjölkig skärm):** `grep '\[PWR\]'` — jämför `post settle` vs `display done` vbat.
+
+**±1 i STANDBY:** `put fail`, ingen success-vibration (HTTP 400 eller COMPLETED≠200).
+
+**Acceptans båt:** ett tryck AUTO/STANDBY → vibration + P70; skärm skarp eller dokumenterad vbat-sänkning.
+
+## Serial — ström/display (`[PWR]`)
+
+Sök: `grep '\[PWR\]' watchy-boat.log`
+
+| Tag | Betydelse |
+|-----|-----------|
+| `wake` / `setup` | Basnivå vid start |
+| `wifi ok` + `connect_ms` | Anslutningstid (båt ofta längre) |
+| `sk sync start` / `done` | Före/efter GET autopilot |
+| `session start` / `end` | WiFi-session |
+| `put start` / `ok` / `fail` | PUT-belastning |
+| `pre display wifi off` / `post settle` | Före/efter 1 s paus före e-paper |
+| `display done` | Efter full refresh |
+
+**Mjölkig skärm:** jämför `vbat` på `post settle` vs `display done` (hemma vs båt). Sjunker >0,1 V under en väckning → underspänning.

@@ -62,6 +62,7 @@ private:
   void sessionDisplayTick(bool force = false);
   void waitButtonsReleased();
   void paintWatchFaceFull(bool reinitPanel);
+  void disconnectWifiBeforeDisplay();
   void refreshDisplaySafe();
   void syncLiveDataBeforeDisplay();
   void syncClockFromNtp();

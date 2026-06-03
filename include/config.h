@@ -43,9 +43,15 @@ inline float apNormalizeHeadingDeg(float deg) {
 #define SK_PUT_POLL_INTERVAL_MS 600
 #define SK_PUT_POLL_TIMEOUT_MS 15000
 #define SK_PUT_POLL_TIMEOUT_SESSION_MS 15000
+// Max HTTP body for PUT 202 / request poll (~278 B on Pi; avoid heap String+JSONVar).
+#define SK_HTTP_BODY_MAX 512
+// GET vessels.self/steering/autopilot (~1–2 KB on boat; stack buffer, no JSON.parse).
+#define SK_GET_BODY_MAX 3072
 #define WIFI_CONNECT_MS 15000
 #define WIFI_RECOVER_MS 2500
 #define WIFI_WARM_SEC 45
+// Pause after WiFi off before full e-paper (boat AP: weak RSSI → longer radio burst).
+#define WIFI_DISPLAY_SETTLE_MS 1000
 
 // MENU: enkel = wake, dubbel = AUTO↔WIND, håll = STANDBY↔AUTO/WIND→STANDBY
 #define BTN_HOLD_ADJUST_MS 650

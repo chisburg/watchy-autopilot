@@ -1,5 +1,6 @@
 #include "AutopilotWatchy.h"
 
+#include "ap_power.h"
 #include "display_session.h"
 #include <cstring>
 #include <stdarg.h>
@@ -264,10 +265,10 @@ const char *AutopilotWatchy::btnName(uint64_t mask) {
 
 void AutopilotWatchy::logState(const char *tag) {
 #if AP_DEBUG
+  apLogPower(tag);
   const int hdg = (int)roundf(apNormalizeHeadingDeg(targetHeadingDeg));
-  AP_LOG("%s state=%s target=%03d valid=%d sk=%d vbat=%.2f", tag,
-         stateLabel(), hdg, (int)targetValid, (int)skLinked,
-         getBatteryVoltage());
+  AP_LOG("%s state=%s target=%03d valid=%d sk=%d", tag, stateLabel(), hdg,
+         (int)targetValid, (int)skLinked);
 #endif
 }
 
@@ -599,6 +600,7 @@ void AutopilotWatchy::waitButtonsReleased() {
 
 void AutopilotWatchy::syncLiveDataBeforeDisplay() {
 #if !SIM_MODE
+  apLogBattery("sk sync start");
   if (SignalKClient::ensureConnected()) {
     syncClockFromNtp();
     if (!refreshFromSignalK()) {
@@ -608,7 +610,9 @@ void AutopilotWatchy::syncLiveDataBeforeDisplay() {
     skLinked = false;
     profileLabel[0] = '\0';
     AP_LOG("WiFi connect failed");
+    apLogPower("sk sync fail");
   }
+  apLogPower("sk sync done");
 #endif
 }
 
@@ -625,14 +629,21 @@ void AutopilotWatchy::paintWatchFaceFull(bool reinitPanel) {
   display.epd2.setBusyCallback(WatchyDisplay::busyCallback);
   guiState = WATCHFACE_STATE;
   AP_LOG("display refresh %lums", millis() - t0);
+  apLogBattery("display done");
+}
+
+void AutopilotWatchy::disconnectWifiBeforeDisplay() {
+  gDisplayWifiSession = false;
+#if !SIM_MODE
+  apLogPower("pre display wifi off");
+  SignalKClient::disconnect();
+  delay(WIFI_DISPLAY_SETTLE_MS);
+  apLogBattery("post settle");
+#endif
 }
 
 void AutopilotWatchy::refreshDisplaySafe() {
-  gDisplayWifiSession = false;
-#if !SIM_MODE
-  SignalKClient::disconnect();
-  delay(300);
-#endif
+  disconnectWifiBeforeDisplay();
   RTC.read(currentTime);
   AP_LOG("display %02d:%02d target=%03d state=%s sk=%d", currentTime.Hour,
          currentTime.Minute, (int)roundf(targetHeadingDeg), stateLabel(),
@@ -647,8 +658,10 @@ void AutopilotWatchy::bootSyncBeforeDisplay() {
   profileLabel[0] = '\0';
   AP_LOG("boot live sync");
   syncLiveDataBeforeDisplay();
-  SignalKClient::disconnect();
-  delay(300);
+  disconnectWifiBeforeDisplay();
+#else
+  paintWatchFaceFull(true);
+  return;
 #endif
   paintWatchFaceFull(true);
 }
@@ -735,6 +748,7 @@ void AutopilotWatchy::disconnectBeforeSleep() {
 }
 
 void AutopilotWatchy::runActiveSession() {
+  apLogPower("session start");
   AP_LOG("session start %ds", ACTIVE_SESSION_MS / 1000);
   detachInterrupt(digitalPinToInterrupt(UP_BTN_PIN));
   detachInterrupt(digitalPinToInterrupt(DOWN_BTN_PIN));
@@ -788,6 +802,7 @@ void AutopilotWatchy::runActiveSession() {
   }
 
   AP_LOG("session end");
+  apLogPower("session end");
   gDisplayWifiSession = false;
   SignalKClient::setSessionMode(false);
   activeSession = false;
@@ -1157,6 +1172,7 @@ void AutopilotWatchy::handleButtonPress() {
 
   AP_LOG("wake btn=%s mask=0x%lx", btnName(wakeupBit),
          (unsigned long)wakeupBit);
+  apLogBattery("wake");
 
   int wakeHeadingDelta = 0;
   if (wakeupBit == AP_UP_BTN_MASK || wakeupBit == AP_DOWN_BTN_MASK) {

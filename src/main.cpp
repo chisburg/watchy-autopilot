@@ -1,4 +1,5 @@
 #include "AutopilotWatchy.h"
+#include "ap_power.h"
 #include "display_session.h"
 #include "settings.h"
 
@@ -21,6 +22,7 @@ void initVariant() {
 void setup() {
   Serial.begin(115200);
   Serial.println("watchy-autopilot boot");
+  apLogBattery("setup");
 #if SIM_MODE
   Serial.println("SIM_MODE=1 (no Signal K traffic)");
 #else
