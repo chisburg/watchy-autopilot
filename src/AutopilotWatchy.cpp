@@ -26,8 +26,10 @@
 #endif
 
 RTC_DATA_ATTR float AutopilotWatchy::targetHeadingDeg = 335.0f;
+RTC_DATA_ATTR float AutopilotWatchy::windAngleDeg = 0.0f;
 RTC_DATA_ATTR ApDisplayState AutopilotWatchy::apState = ApDisplayState::Auto;
 RTC_DATA_ATTR bool AutopilotWatchy::targetValid = true;
+RTC_DATA_ATTR bool AutopilotWatchy::windValid = false;
 RTC_DATA_ATTR bool AutopilotWatchy::skLinked = false;
 RTC_DATA_ATTR char AutopilotWatchy::profileLabel[8] = "";
 RTC_DATA_ATTR int8_t AutopilotWatchy::pendingWakeHeadingDelta = 0;
@@ -336,7 +338,14 @@ void AutopilotWatchy::drawWatchFace() {
 
   char buf[16];
 
-  if (targetValid && apState != ApDisplayState::Wind) {
+  if (apState == ApDisplayState::Wind) {
+    if (windValid) {
+      const int wind = (int)roundf(windAngleDeg);
+      snprintf(buf, sizeof(buf), "%03d", (int)abs(wind) % 1000);
+    } else {
+      snprintf(buf, sizeof(buf), "---");
+    }
+  } else if (targetValid) {
     formatHeading(targetHeadingDeg, buf, sizeof(buf));
   } else {
     snprintf(buf, sizeof(buf), "---");
@@ -426,7 +435,10 @@ ApCommand AutopilotWatchy::resolveUpDown(bool up) {
   return up ? ApCommand::AdjustPlus1 : ApCommand::AdjustMinus1;
 }
 
-ApCommand AutopilotWatchy::resolveSelect() {
+ApCommand AutopilotWatchy::resolveSelect(bool *menuLongHold) {
+  if (menuLongHold) {
+    *menuLongHold = false;
+  }
   pinMode(MENU_BTN_PIN, INPUT);
   unsigned long heldMs = 0;
 
@@ -436,6 +448,9 @@ ApCommand AutopilotWatchy::resolveSelect() {
     if (heldMs >= BTN_HOLD_STANDBY_MS) {
       while (isPressed(AP_MENU_BTN_MASK)) {
         delay(5);
+      }
+      if (menuLongHold) {
+        *menuLongHold = true;
       }
       return menuCmdFromLongHold();
     }
@@ -489,30 +504,12 @@ int AutopilotWatchy::collectWakeHeadingDelta(uint64_t btnMask) {
   return collectWakeHeadingDeltaImpl(btnMask);
 }
 
-void AutopilotWatchy::sessionDisplayTick(bool force) {
-  (void)force;
-#if SIM_MODE
-  if (!activeSession) {
-    return;
-  }
-  showWatchFace(true);
-  sessionLastDisplayMs = millis();
-#else
-  // Live session: no e-paper while WiFi active (brownout / crash on Watchy).
-#endif
-}
-
 void AutopilotWatchy::handleSessionHeadingPress(uint64_t btnMask) {
   const int delta = sessionCollectHeadingDelta(btnMask);
   if (delta == 0) {
     return;
   }
-  if (!executeSessionHeadingDelta(delta)) {
-    return;
-  }
-#if SIM_MODE
-  sessionDisplayTick(true);
-#endif
+  executeSessionHeadingDelta(delta);
 }
 
 bool AutopilotWatchy::executeSessionHeadingDelta(int delta) {
@@ -520,43 +517,64 @@ bool AutopilotWatchy::executeSessionHeadingDelta(int delta) {
     AP_LOG("ignore heading adjust in STANDBY");
     return false;
   }
+  if (delta == 0) {
+    return false;
+  }
 
-  AP_LOG("command %s%d", delta > 0 ? "+" : "", delta);
+  const int sign = delta > 0 ? 1 : -1;
+  const bool isTen = (delta == 10 || delta == -10);
+  const int steps = isTen ? 1 : (delta < 0 ? -delta : delta);
+  if (steps > 5) {
+    AP_LOG("ignore heading burst >5");
+    return false;
+  }
+
+  bool anyOk = false;
+
+  for (int i = 0; i < steps; i++) {
+    const int putDeg = isTen ? delta : sign;
+    AP_LOG("command %s%d (%d/%d)", putDeg > 0 ? "+" : "", putDeg, i + 1,
+           steps);
 
 #if SIM_MODE
-  targetHeadingDeg += (float)delta;
-  targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
-  logState("after");
-  vibeConfirmPause();
-  if (delta <= -10 || delta >= 10) {
-    vibeDouble();
-  } else {
-    vibeForDelta(delta);
-  }
-  return true;
-#else
-  const bool ok = SignalKClient::putAdjustHeading(delta);
-  if (ok) {
-    targetHeadingDeg += (float)delta;
+    targetHeadingDeg += (float)putDeg;
     targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
     targetValid = true;
     vibeConfirmPause();
-    if (delta <= -10 || delta >= 10) {
-      vibeDouble();
+    if (isTen) {
+      vibeLong();
     } else {
-      vibeForDelta(delta);
+      vibeSingle();
     }
-    logState("after");
-    pendingSessionDisplay = true;
-    lastBatchOkMs = millis();
-    return true;
+    anyOk = true;
+#else
+    if (!SignalKClient::putAdjustHeading(putDeg)) {
+      AP_LOG("command failed — no vibration");
+      if (!anyOk) {
+        refreshFromSignalK();
+        logState("after");
+        return false;
+      }
+      break;
+    }
+    targetHeadingDeg += (float)putDeg;
+    targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
+    targetValid = true;
+    vibeConfirmPause();
+    if (isTen) {
+      vibeLong();
+    } else {
+      vibeSingle();
+    }
+    anyOk = true;
+#endif
   }
 
-  AP_LOG("command failed — no vibration");
-  refreshFromSignalK();
-  logState("after");
-  return false;
-#endif
+  if (anyOk) {
+    logState("after");
+    sessionNeedsDisplay = true;
+  }
+  return anyOk;
 }
 
 uint64_t AutopilotWatchy::pollButtonDown(uint32_t timeoutMs) {
@@ -679,65 +697,18 @@ void AutopilotWatchy::syncClockFromNtp() {
 #endif
 }
 
-void AutopilotWatchy::sessionDisplayAfterBatch() {
-  if (sessionDisplayInProgress) {
-    return;
-  }
-  sessionDisplayInProgress = true;
-  pendingSessionDisplay = false;
-
-  AP_LOG("batch display");
-  refreshDisplaySafe();
-  sessionLastDisplayMs = millis();
-#if !SIM_MODE
-  if (!SignalKClient::ensureConnected()) {
-    AP_LOG("WiFi reconnect after display failed");
-    skLinked = false;
-  } else {
-    gDisplayWifiSession = true;
-  }
-#endif
-  sessionDisplayInProgress = false;
-}
-
-void AutopilotWatchy::maybeFlushPendingSessionDisplay() {
-  if (!pendingSessionDisplay || sessionDisplayInProgress) {
-    return;
-  }
-  if ((long)(millis() - lastBatchOkMs) < BATCH_DISPLAY_IDLE_MS) {
-    return;
-  }
-  sessionDisplayAfterBatch();
-}
-
 void AutopilotWatchy::finishSessionWithDisplay() {
+  if (!sessionNeedsDisplay) {
+    disconnectBeforeSleep();
+    return;
+  }
+  sessionNeedsDisplay = false;
+  AP_LOG("session display");
 #if !SIM_MODE
-  // Batch flush at session end is handled in runActiveSession().
-  if (sessionLastDisplayMs == 0) {
-    syncLiveDataBeforeDisplay();
-    refreshDisplaySafe();
-  }
-  disconnectBeforeSleep();
-#else
-  if (sessionLastDisplayMs == 0) {
-    refreshDisplaySafe();
-  }
+  syncLiveDataBeforeDisplay();
 #endif
-}
-
-void AutopilotWatchy::displayAfterModeChange() {
-  AP_LOG("mode display");
   refreshDisplaySafe();
-  sessionLastDisplayMs = millis();
-  pendingSessionDisplay = false;
-#if !SIM_MODE
-  if (!SignalKClient::ensureConnected()) {
-    AP_LOG("WiFi reconnect after mode display failed");
-    skLinked = false;
-  } else {
-    gDisplayWifiSession = true;
-  }
-#endif
+  disconnectBeforeSleep();
 }
 
 void AutopilotWatchy::disconnectBeforeSleep() {
@@ -753,7 +724,6 @@ void AutopilotWatchy::runActiveSession() {
   detachInterrupt(digitalPinToInterrupt(UP_BTN_PIN));
   detachInterrupt(digitalPinToInterrupt(DOWN_BTN_PIN));
   activeSession = true;
-  sessionDisplayInProgress = false;
   gDisplayWifiSession = true;
   SignalKClient::setSessionMode(true);
 
@@ -774,7 +744,6 @@ void AutopilotWatchy::runActiveSession() {
     uint64_t btn = pollButtonDown(slice);
 
     if (btn == 0) {
-      maybeFlushPendingSessionDisplay();
       continue;
     }
     if (btn == AP_BACK_BTN_MASK) {
@@ -790,15 +759,17 @@ void AutopilotWatchy::runActiveSession() {
       continue;
     }
 
-    ApCommand cmd = resolveCommand(btn);
+    bool menuLongHold = false;
+    ApCommand cmd = ApCommand::None;
+    if (btn == AP_MENU_BTN_MASK) {
+      cmd = resolveSelect(&menuLongHold);
+    } else {
+      cmd = resolveCommand(btn);
+    }
     if (cmd != ApCommand::None) {
-      executeSessionCommand(cmd);
+      executeSessionCommand(cmd, menuLongHold);
       sessionEnd = millis() + ACTIVE_SESSION_MS;
     }
-  }
-
-  if (pendingSessionDisplay) {
-    sessionDisplayAfterBatch();
   }
 
   AP_LOG("session end");
@@ -842,44 +813,12 @@ void AutopilotWatchy::vibeDouble() {
   vibePulse(VIB_DOUBLE_MS);
 }
 
-void AutopilotWatchy::vibeForDelta(int delta) {
-  int n = delta < 0 ? -delta : delta;
-  if (n <= 1) {
-    vibeSingle();
-    return;
-  }
-  if (n > 5) {
-    n = 5;
-  }
-  for (int i = 0; i < n; i++) {
-    vibePulse(120);
-    if (i + 1 < n) {
-      delay(55);
-    }
-  }
+void AutopilotWatchy::vibeLong() {
+  vibePulse(VIB_LONG_MS);
 }
 
-void AutopilotWatchy::vibeForMode(ApCommand cmd) {
-  int n = 0;
-  switch (cmd) {
-  case ApCommand::SetStandby:
-    n = 1;
-    break;
-  case ApCommand::SetAuto:
-    n = 2;
-    break;
-  case ApCommand::SetWind:
-    n = 3;
-    break;
-  default:
-    return;
-  }
-  for (int i = 0; i < n; i++) {
-    vibePulse(VIB_DOUBLE_MS);
-    if (i + 1 < n) {
-      delay(VIB_GAP_MS);
-    }
-  }
+void AutopilotWatchy::vibeExtraLong() {
+  vibePulse(VIB_EXTRA_LONG_MS);
 }
 
 bool AutopilotWatchy::isModeCommand(ApCommand cmd) {
@@ -887,24 +826,32 @@ bool AutopilotWatchy::isModeCommand(ApCommand cmd) {
          cmd == ApCommand::SetWind;
 }
 
-void AutopilotWatchy::vibeAfterCommand(ApCommand cmd) {
+void AutopilotWatchy::vibeAfterCommand(ApCommand cmd, bool menuLongHold) {
   vibeConfirmPause();
-  if (isModeCommand(cmd)) {
-    vibeForMode(cmd);
-  } else if (isDoubleAction(cmd)) {
-    vibeDouble();
-  } else {
-    vibeSingle();
-  }
-}
-
-bool AutopilotWatchy::isDoubleAction(ApCommand cmd) const {
   switch (cmd) {
+  case ApCommand::SetStandby:
+    vibeExtraLong();
+    break;
+  case ApCommand::SetAuto:
+    if (menuLongHold) {
+      vibeExtraLong();
+    } else {
+      vibeDouble();
+    }
+    break;
+  case ApCommand::SetWind:
+    vibeDouble();
+    break;
   case ApCommand::AdjustPlus10:
   case ApCommand::AdjustMinus10:
-    return true;
+    vibeLong();
+    break;
+  case ApCommand::AdjustPlus1:
+  case ApCommand::AdjustMinus1:
+    vibeSingle();
+    break;
   default:
-    return false;
+    break;
   }
 }
 
@@ -924,6 +871,12 @@ void AutopilotWatchy::applySkSnapshot(const SkAutopilotSnapshot &snap) {
   } else if (strcmp(snap.state, "wind") == 0) {
     apState = ApDisplayState::Wind;
     targetValid = false;
+    if (snap.windValid) {
+      windAngleDeg = snap.windAngleDeg;
+      windValid = true;
+    } else {
+      windValid = false;
+    }
   } else {
     apState = ApDisplayState::Unknown;
   }
@@ -1039,7 +992,7 @@ void AutopilotWatchy::simApply(ApCommand cmd) {
   }
 }
 
-void AutopilotWatchy::executeCommand(ApCommand cmd) {
+void AutopilotWatchy::executeCommand(ApCommand cmd, bool menuLongHold) {
   if (cmd == ApCommand::None) {
     return;
   }
@@ -1076,25 +1029,44 @@ void AutopilotWatchy::executeCommand(ApCommand cmd) {
 #if SIM_MODE
   simApply(cmd);
   logState("after");
-  vibeAfterCommand(cmd);
-  if (isModeCommand(cmd)) {
-    displayAfterModeChange();
+  if (cmd == ApCommand::AdjustPlus1 || cmd == ApCommand::AdjustMinus1 ||
+      cmd == ApCommand::AdjustPlus10 || cmd == ApCommand::AdjustMinus10) {
+    const int delta = (cmd == ApCommand::AdjustPlus10 ||
+                       cmd == ApCommand::AdjustPlus1)
+                          ? (cmd == ApCommand::AdjustPlus10 ? 10 : 1)
+                          : (cmd == ApCommand::AdjustMinus10 ? -10 : -1);
+    executeSessionHeadingDelta(delta);
+  } else {
+    vibeAfterCommand(cmd, menuLongHold);
+    sessionNeedsDisplay = true;
   }
 #else
-  const bool ok = liveApply(cmd);
-  logState("after");
-  if (ok) {
-    vibeAfterCommand(cmd);
-    if (isModeCommand(cmd)) {
-      displayAfterModeChange();
-    }
+  if (cmd == ApCommand::AdjustPlus1 || cmd == ApCommand::AdjustMinus1 ||
+      cmd == ApCommand::AdjustPlus10 || cmd == ApCommand::AdjustMinus10) {
+    const int delta = (cmd == ApCommand::AdjustPlus10 ||
+                       cmd == ApCommand::AdjustPlus1)
+                          ? (cmd == ApCommand::AdjustPlus10 ? 10 : 1)
+                          : (cmd == ApCommand::AdjustMinus10 ? -10 : -1);
+    executeSessionHeadingDelta(delta);
   } else {
-    AP_LOG("command failed — no vibration");
+    const bool ok = putCommand(cmd);
+    if (ok) {
+      if (!refreshFromSignalK()) {
+        AP_LOG("SK read after PUT failed");
+      }
+      logState("after");
+      vibeAfterCommand(cmd, menuLongHold);
+      sessionNeedsDisplay = true;
+    } else {
+      AP_LOG("command failed — no vibration");
+      refreshFromSignalK();
+      logState("after");
+    }
   }
 #endif
 }
 
-void AutopilotWatchy::executeSessionCommand(ApCommand cmd) {
+void AutopilotWatchy::executeSessionCommand(ApCommand cmd, bool menuLongHold) {
   if (cmd == ApCommand::None) {
     return;
   }
@@ -1129,32 +1101,41 @@ void AutopilotWatchy::executeSessionCommand(ApCommand cmd) {
   AP_LOG("command %s", name);
 
 #if SIM_MODE
-  simApply(cmd);
-  logState("after");
-  vibeAfterCommand(cmd);
-  if (isModeCommand(cmd)) {
-    displayAfterModeChange();
+  if (cmd == ApCommand::AdjustPlus1 || cmd == ApCommand::AdjustMinus1 ||
+      cmd == ApCommand::AdjustPlus10 || cmd == ApCommand::AdjustMinus10) {
+    const int delta = (cmd == ApCommand::AdjustPlus10 ||
+                       cmd == ApCommand::AdjustPlus1)
+                          ? (cmd == ApCommand::AdjustPlus10 ? 10 : 1)
+                          : (cmd == ApCommand::AdjustMinus10 ? -10 : -1);
+    executeSessionHeadingDelta(delta);
   } else {
-    sessionDisplayTick(true);
+    simApply(cmd);
+    logState("after");
+    vibeAfterCommand(cmd, menuLongHold);
+    sessionNeedsDisplay = true;
   }
 #else
-  const bool ok = putCommand(cmd);
-  if (ok) {
-    if (!refreshFromSignalK()) {
-      AP_LOG("SK read after PUT failed");
-    }
-    logState("after");
-    vibeAfterCommand(cmd);
-    if (isModeCommand(cmd)) {
-      displayAfterModeChange();
-    } else {
-      pendingSessionDisplay = true;
-      lastBatchOkMs = millis();
-    }
+  if (cmd == ApCommand::AdjustPlus1 || cmd == ApCommand::AdjustMinus1 ||
+      cmd == ApCommand::AdjustPlus10 || cmd == ApCommand::AdjustMinus10) {
+    const int delta = (cmd == ApCommand::AdjustPlus10 ||
+                       cmd == ApCommand::AdjustPlus1)
+                          ? (cmd == ApCommand::AdjustPlus10 ? 10 : 1)
+                          : (cmd == ApCommand::AdjustMinus10 ? -10 : -1);
+    executeSessionHeadingDelta(delta);
   } else {
-    AP_LOG("command failed — no vibration");
-    refreshFromSignalK();
-    logState("after");
+    const bool ok = putCommand(cmd);
+    if (ok) {
+      if (!refreshFromSignalK()) {
+        AP_LOG("SK read after PUT failed");
+      }
+      logState("after");
+      vibeAfterCommand(cmd, menuLongHold);
+      sessionNeedsDisplay = true;
+    } else {
+      AP_LOG("command failed — no vibration");
+      refreshFromSignalK();
+      logState("after");
+    }
   }
 #endif
 }
@@ -1211,8 +1192,14 @@ void AutopilotWatchy::handleButtonPress() {
 
   if (wakeupBit == AP_MENU_BTN_MASK) {
     const int menuPresses = consumePendingWakeMenuPresses();
-    ApCommand cmd = menuPresses != 0 ? menuCmdFromPressCount(menuPresses)
-                                     : resolveSelect();
+    bool menuLongHold = false;
+    ApCommand cmd = ApCommand::None;
+    if (menuPresses != 0) {
+      menuLongHold = menuPresses < 0;
+      cmd = menuCmdFromPressCount(menuPresses);
+    } else {
+      cmd = resolveSelect(&menuLongHold);
+    }
     waitButtonsReleased();
 
     if (cmd == ApCommand::None) {
@@ -1236,7 +1223,7 @@ void AutopilotWatchy::handleButtonPress() {
       refreshFromSignalK();
     }
 #endif
-    executeCommand(cmd);
+    executeCommand(cmd, menuLongHold);
     runActiveSession();
     finishSessionWithDisplay();
     return;

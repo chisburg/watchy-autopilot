@@ -11,6 +11,8 @@ struct SkAutopilotSnapshot {
   char state[16] = "";
   float targetHeadingDeg = 0.0f;
   bool targetValid = false;
+  float windAngleDeg = 0.0f;
+  bool windValid = false;
 };
 
 class SignalKClient {

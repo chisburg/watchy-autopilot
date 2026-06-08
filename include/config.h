@@ -53,24 +53,24 @@ inline float apNormalizeHeadingDeg(float deg) {
 // Pause after WiFi off before full e-paper (boat AP: weak RSSI → longer radio burst).
 #define WIFI_DISPLAY_SETTLE_MS 1000
 
-// MENU: enkel = wake, dubbel = AUTO↔WIND, håll = STANDBY↔AUTO/WIND→STANDBY
+// MENU: enkel = wake, dubbel = AUTO↔WIND, håll ~2s = STANDBY↔AUTO
 #define BTN_HOLD_ADJUST_MS 650
 #define BTN_SELECT_MULTI_WINDOW_MS 550
-#define BTN_HOLD_STANDBY_MS 1500
+#define BTN_HOLD_STANDBY_MS 2000
 #define BTN_DEBOUNCE_MS 30
 #define BTN_SESSION_BURST_MS 400
 #define BTN_WAKE_BURST_MS 800
 #define BTN_WAKE_EXTEND_MS 500
 #define POST_PUT_COLLECT_MS 250
-#define SESSION_DISPLAY_MIN_MS 1500
-#define BATCH_DISPLAY_IDLE_MS 3000
 #define WIFI_SESSION_WARM_MS 3000
 #define ACTIVE_SESSION_MS 20000
 
-// Vibration: kort = ±1, lång ×1/2/3 = STANDBY/AUTO/WIND, dubbel kort = ±10
+// Vibration: kort = ±1 OK, dubbel = AUTO↔WIND, lång = ±10, extra lång = håll MENU
 #define VIB_CONFIRM_DELAY_MS 100
 #define VIB_SINGLE_MS 200
-#define VIB_DOUBLE_MS 450
+#define VIB_DOUBLE_MS 200
+#define VIB_LONG_MS 550
+#define VIB_EXTRA_LONG_MS 1000
 #define VIB_GAP_MS 80
 
 #endif

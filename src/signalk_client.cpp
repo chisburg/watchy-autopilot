@@ -623,10 +623,19 @@ bool SignalKClient::fetchAutopilot(const SkProfile &profile,
     out.targetValid = false;
   }
 
+  double windRad = 0.0;
+  if (extractSkObjectNumberValue(body, "windAngleApparent", windRad)) {
+    out.windAngleDeg = (float)(windRad * 180.0 / M_PI);
+    out.windValid = true;
+  } else {
+    out.windValid = false;
+  }
+
   out.profileLabel = profile.label;
   out.ok = true;
-  AP_LOG("SK state=%s target=%03d valid=%d", out.state,
-         (int)roundf(out.targetHeadingDeg), (int)out.targetValid);
+  AP_LOG("SK state=%s target=%03d wind=%d valid=%d windValid=%d", out.state,
+         (int)roundf(out.targetHeadingDeg), (int)roundf(out.windAngleDeg),
+         (int)out.targetValid, (int)out.windValid);
   return true;
 }
 
@@ -640,6 +649,10 @@ bool SignalKClient::readAutopilot(SkAutopilotSnapshot &out) {
 }
 
 bool SignalKClient::putAdjustHeading(int degrees) {
+  if (degrees != 1 && degrees != -1 && degrees != 10 && degrees != -10) {
+    AP_LOG("HTTP put: invalid adjustHeading %d", degrees);
+    return false;
+  }
   const SkProfile *profile = activeProfile();
   if (profile == nullptr) {
     AP_LOG("HTTP put: no profile");
