@@ -50,10 +50,14 @@ inline float apNormalizeHeadingDeg(float deg) {
 #define WIFI_CONNECT_MS 15000
 #define WIFI_RECOVER_MS 2500
 #define WIFI_WARM_SEC 45
-// Pause after WiFi off before full e-paper (boat AP: weak RSSI → longer radio burst).
+// Pause after WiFi off before full e-paper (strong signal, close to AP).
 #define WIFI_DISPLAY_SETTLE_MS 1000
+// Weak WiFi or low battery: longer radio burst → need more voltage recovery.
+#define WIFI_DISPLAY_SETTLE_WEAK_MS 3000
+#define WIFI_DISPLAY_RSSI_WEAK_DBM -70
+#define WIFI_DISPLAY_VBAT_WEAK_V 3.90f
 
-// MENU: enkel = wake, dubbel = AUTO↔WIND, håll ~2s = STANDBY↔AUTO
+// MENU: enkel = wake, dubbel = AUTO↔WIND, håll ~2s (utan släpp) = STANDBY↔AUTO
 #define BTN_HOLD_ADJUST_MS 650
 #define BTN_SELECT_MULTI_WINDOW_MS 550
 #define BTN_HOLD_STANDBY_MS 2000
@@ -63,9 +67,11 @@ inline float apNormalizeHeadingDeg(float deg) {
 #define BTN_WAKE_EXTEND_MS 500
 #define POST_PUT_COLLECT_MS 250
 #define WIFI_SESSION_WARM_MS 3000
-#define ACTIVE_SESSION_MS 20000
+#define ACTIVE_SESSION_MS 5000
 
-// Vibration: kort = ±1 OK, dubbel = AUTO↔WIND, lång = ±10, extra lång = håll MENU
+// Vibration: wake = knapp registrerad, kort = ±1 OK, dubbel = AUTO↔WIND, lång = ±10
+#define VIB_WAKE_MS 80
+#define VIB_POST_MS 300
 #define VIB_CONFIRM_DELAY_MS 100
 #define VIB_SINGLE_MS 200
 #define VIB_DOUBLE_MS 200

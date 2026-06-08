@@ -127,9 +127,6 @@ void AutopilotWatchy::captureWakeMenuPressesEarly() {
     delay(10);
     heldMs += 10;
     if (heldMs >= BTN_HOLD_STANDBY_MS) {
-      while (digitalRead(MENU_BTN_PIN) == BTN_ACTIVE) {
-        delay(5);
-      }
       pendingWakeMenuPresses = -1;
       return;
     }
@@ -446,9 +443,6 @@ ApCommand AutopilotWatchy::resolveSelect(bool *menuLongHold) {
     delay(10);
     heldMs += 10;
     if (heldMs >= BTN_HOLD_STANDBY_MS) {
-      while (isPressed(AP_MENU_BTN_MASK)) {
-        delay(5);
-      }
       if (menuLongHold) {
         *menuLongHold = true;
       }
@@ -540,16 +534,10 @@ bool AutopilotWatchy::executeSessionHeadingDelta(int delta) {
     targetHeadingDeg += (float)putDeg;
     targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
     targetValid = true;
-    vibeConfirmPause();
-    if (isTen) {
-      vibeLong();
-    } else {
-      vibeSingle();
-    }
     anyOk = true;
 #else
     if (!SignalKClient::putAdjustHeading(putDeg)) {
-      AP_LOG("command failed — no vibration");
+      AP_LOG("command failed");
       if (!anyOk) {
         refreshFromSignalK();
         logState("after");
@@ -560,18 +548,16 @@ bool AutopilotWatchy::executeSessionHeadingDelta(int delta) {
     targetHeadingDeg += (float)putDeg;
     targetHeadingDeg = apNormalizeHeadingDeg(targetHeadingDeg);
     targetValid = true;
-    vibeConfirmPause();
-    if (isTen) {
-      vibeLong();
-    } else {
-      vibeSingle();
-    }
     anyOk = true;
 #endif
   }
 
   if (anyOk) {
     logState("after");
+    if (isTen) {
+      vibeConfirmPause();
+      vibeLong();
+    }
     sessionNeedsDisplay = true;
   }
   return anyOk;
@@ -616,8 +602,19 @@ void AutopilotWatchy::waitButtonsReleased() {
   delay(BTN_DEBOUNCE_MS);
 }
 
-void AutopilotWatchy::syncLiveDataBeforeDisplay() {
-#if !SIM_MODE
+bool AutopilotWatchy::syncLiveDataBeforeDisplay() {
+#if SIM_MODE
+  return false;
+#else
+  const float prevTarget = targetHeadingDeg;
+  const ApDisplayState prevState = apState;
+  const bool prevSk = skLinked;
+  const bool prevWindValid = windValid;
+  const float prevWind = windAngleDeg;
+  char prevProfile[8];
+  strncpy(prevProfile, profileLabel, sizeof(prevProfile));
+  prevProfile[sizeof(prevProfile) - 1] = '\0';
+
   apLogBattery("sk sync start");
   if (SignalKClient::ensureConnected()) {
     syncClockFromNtp();
@@ -631,13 +628,53 @@ void AutopilotWatchy::syncLiveDataBeforeDisplay() {
     apLogPower("sk sync fail");
   }
   apLogPower("sk sync done");
+
+  if (strcmp(prevProfile, profileLabel) != 0 || prevSk != skLinked ||
+      prevState != apState || prevWindValid != windValid ||
+      (windValid && prevWind != windAngleDeg) ||
+      (targetValid && prevTarget != targetHeadingDeg)) {
+    return true;
+  }
+  return false;
 #endif
+}
+
+bool AutopilotWatchy::displayNeedsRecovery() const {
+#if SIM_MODE
+  (void)this;
+  return false;
+#else
+  if (lastWifiRssiDbm <= WIFI_DISPLAY_RSSI_WEAK_DBM) {
+    return true;
+  }
+  return apReadBatteryV() < WIFI_DISPLAY_VBAT_WEAK_V;
+#endif
+}
+
+uint16_t AutopilotWatchy::displaySettleMs() const {
+  return displayNeedsRecovery() ? WIFI_DISPLAY_SETTLE_WEAK_MS
+                                : WIFI_DISPLAY_SETTLE_MS;
+}
+
+void AutopilotWatchy::paintWatchFaceFromCache() {
+  display.epd2.setBusyCallback(0);
+  display.epd2.initWatchyFull();
+  display.setFullWindow();
+  RTC.read(currentTime);
+  const unsigned long t0 = millis();
+  drawWatchFace();
+  display.display(false);
+  display.epd2.setBusyCallback(WatchyDisplay::busyCallback);
+  guiState = WATCHFACE_STATE;
+  AP_LOG("cache display %lums", millis() - t0);
 }
 
 void AutopilotWatchy::paintWatchFaceFull(bool reinitPanel) {
   (void)reinitPanel;
-  // Stock Watchy setupWifi pattern: no light sleep during refresh, always full init.
   display.epd2.setBusyCallback(0);
+  if (displayNeedsRecovery()) {
+    AP_LOG("display weak recovery rssi=%d", (int)lastWifiRssiDbm);
+  }
   display.epd2.initWatchyFull();
   display.setFullWindow();
   RTC.read(currentTime);
@@ -653,14 +690,23 @@ void AutopilotWatchy::paintWatchFaceFull(bool reinitPanel) {
 void AutopilotWatchy::disconnectWifiBeforeDisplay() {
   gDisplayWifiSession = false;
 #if !SIM_MODE
+  lastWifiRssiDbm = -127;
+  if (WiFi.status() == WL_CONNECTED) {
+    lastWifiRssiDbm = (int8_t)WiFi.RSSI();
+  }
   apLogPower("pre display wifi off");
+  SignalKClient::markWifiStale();
   SignalKClient::disconnect();
-  delay(WIFI_DISPLAY_SETTLE_MS);
+  const uint16_t settleMs = displaySettleMs();
+  AP_LOG("display settle %ums rssi=%d recovery=%d", settleMs,
+         (int)lastWifiRssiDbm, (int)displayNeedsRecovery());
+  delay(settleMs);
   apLogBattery("post settle");
 #endif
 }
 
 void AutopilotWatchy::refreshDisplaySafe() {
+  delay(VIB_POST_MS);
   disconnectWifiBeforeDisplay();
   RTC.read(currentTime);
   AP_LOG("display %02d:%02d target=%03d state=%s sk=%d", currentTime.Hour,
@@ -724,6 +770,12 @@ void AutopilotWatchy::runActiveSession() {
   detachInterrupt(digitalPinToInterrupt(UP_BTN_PIN));
   detachInterrupt(digitalPinToInterrupt(DOWN_BTN_PIN));
   activeSession = true;
+#if !SIM_MODE
+  if (!SignalKClient::ensureConnected()) {
+    skLinked = false;
+    AP_LOG("session wifi reconnect failed");
+  }
+#endif
   gDisplayWifiSession = true;
   SignalKClient::setSessionMode(true);
 
@@ -767,7 +819,11 @@ void AutopilotWatchy::runActiveSession() {
       cmd = resolveCommand(btn);
     }
     if (cmd != ApCommand::None) {
+      const bool longHoldCmd = menuLongHold && isModeCommand(cmd);
       executeSessionCommand(cmd, menuLongHold);
+      if (longHoldCmd) {
+        waitButtonsReleased();
+      }
       sessionEnd = millis() + ACTIVE_SESSION_MS;
     }
   }
@@ -797,6 +853,10 @@ void AutopilotWatchy::vibePulse(uint16_t onMs) {
   digitalWrite(VIB_MOTOR_PIN, HIGH);
   delay(onMs);
   digitalWrite(VIB_MOTOR_PIN, LOW);
+}
+
+void AutopilotWatchy::vibeWake() {
+  vibePulse(VIB_WAKE_MS);
 }
 
 void AutopilotWatchy::vibeConfirmPause() {
@@ -1155,6 +1215,75 @@ void AutopilotWatchy::handleButtonPress() {
          (unsigned long)wakeupBit);
   apLogBattery("wake");
 
+  if (wakeupBit == AP_MENU_BTN_MASK) {
+    const int menuPresses = consumePendingWakeMenuPresses();
+    bool menuLongHold = false;
+    ApCommand cmd = ApCommand::None;
+    if (menuPresses != 0) {
+      menuLongHold = menuPresses < 0;
+      cmd = menuCmdFromPressCount(menuPresses);
+    } else {
+      cmd = resolveSelect(&menuLongHold);
+    }
+    const bool longHoldCmd = menuLongHold && cmd != ApCommand::None;
+
+    if (cmd == ApCommand::None) {
+      vibeWake();
+      paintWatchFaceFromCache();
+      waitButtonsReleased();
+      AP_LOG("wake screen");
+#if !SIM_MODE
+      if (syncLiveDataBeforeDisplay()) {
+        refreshDisplaySafe();
+      }
+#endif
+      disconnectBeforeSleep();
+      deepSleep();
+      return;
+    }
+
+    if (longHoldCmd) {
+      AP_LOG("menu long hold %s", stateLabel());
+#if !SIM_MODE
+      if (!SignalKClient::ensureConnected()) {
+        skLinked = false;
+        profileLabel[0] = '\0';
+        AP_LOG("WiFi connect failed");
+      } else {
+        syncClockFromNtp();
+        refreshFromSignalK();
+      }
+#endif
+      executeCommand(cmd, true);
+      waitButtonsReleased();
+      if (sessionNeedsDisplay) {
+        sessionNeedsDisplay = false;
+        refreshDisplaySafe();
+      }
+      disconnectBeforeSleep();
+      deepSleep();
+      return;
+    }
+
+    vibeWake();
+    paintWatchFaceFromCache();
+    waitButtonsReleased();
+#if !SIM_MODE
+    if (!SignalKClient::ensureConnected()) {
+      skLinked = false;
+      profileLabel[0] = '\0';
+      AP_LOG("WiFi connect failed");
+    } else {
+      syncClockFromNtp();
+      refreshFromSignalK();
+    }
+#endif
+    executeCommand(cmd, menuLongHold);
+    runActiveSession();
+    finishSessionWithDisplay();
+    return;
+  }
+
   int wakeHeadingDelta = 0;
   if (wakeupBit == AP_UP_BTN_MASK || wakeupBit == AP_DOWN_BTN_MASK) {
     wakeHeadingDelta = consumePendingWakeHeadingDelta();
@@ -1162,7 +1291,7 @@ void AutopilotWatchy::handleButtonPress() {
       if (wakeHeadingDelta == 0) {
         wakeHeadingDelta = (wakeupBit == AP_UP_BTN_MASK) ? 1 : -1;
       }
-      // Extra window after display init — catches 2nd click during slow boot.
+      // Extra burst window — catches 2nd click during slow boot (no wake display).
       wakeHeadingDelta = collectWakeHeadingDeltaImpl(wakeupBit, wakeHeadingDelta,
                                                      BTN_WAKE_EXTEND_MS);
     }
@@ -1185,45 +1314,6 @@ void AutopilotWatchy::handleButtonPress() {
       executeSessionHeadingDelta(wakeHeadingDelta);
     }
     waitButtonsReleased();
-    runActiveSession();
-    finishSessionWithDisplay();
-    return;
-  }
-
-  if (wakeupBit == AP_MENU_BTN_MASK) {
-    const int menuPresses = consumePendingWakeMenuPresses();
-    bool menuLongHold = false;
-    ApCommand cmd = ApCommand::None;
-    if (menuPresses != 0) {
-      menuLongHold = menuPresses < 0;
-      cmd = menuCmdFromPressCount(menuPresses);
-    } else {
-      cmd = resolveSelect(&menuLongHold);
-    }
-    waitButtonsReleased();
-
-    if (cmd == ApCommand::None) {
-      AP_LOG("wake screen");
-#if !SIM_MODE
-      syncLiveDataBeforeDisplay();
-#endif
-      refreshDisplaySafe();
-      disconnectBeforeSleep();
-      deepSleep();
-      return;
-    }
-
-#if !SIM_MODE
-    if (!SignalKClient::ensureConnected()) {
-      skLinked = false;
-      profileLabel[0] = '\0';
-      AP_LOG("WiFi connect failed");
-    } else {
-      syncClockFromNtp();
-      refreshFromSignalK();
-    }
-#endif
-    executeCommand(cmd, menuLongHold);
     runActiveSession();
     finishSessionWithDisplay();
     return;

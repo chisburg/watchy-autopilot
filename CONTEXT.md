@@ -2,7 +2,7 @@
 
 Projektfil för dig och AI-assistenter. Uppdatera när milestones, miljö eller båttest ändras.
 
-**Senast:** 2026-06-03 — M3/M4-fix + heap-säker PUT/poll; `WIFI_DISPLAY_SETTLE_MS`; serial `[PWR]` (vbat, pct, rssi, connect_ms).
+**Senast:** 2026-06-08 — wake vibe + cache-display; 5s session; RSSI 3s settle; en display/session; `[PWR]`.
 
 ## Vad vi bygger
 
@@ -54,7 +54,7 @@ Device token: `SK_DEVICE_TOKEN` i samma fil — samma token som Pi curl-test.
 | Knapp | Kort | Håll ~1,5 s | Dubbel |
 |-------|------|-------------|--------|
 | UP / DOWN | ±1° | ±10° | — |
-| SELECT/MENU | *(ingen PUT)* `wake screen` | Från **STANDBY** → AUTO; från AUTO/WIND → STANDBY | AUTO↔WIND *(ej från STANDBY)* |
+| SELECT/MENU | *(ingen PUT)* `wake screen` | Håll ~2s utan släpp: STANDBY→AUTO; AUTO/WIND→STANDBY; vibe vid 2s | AUTO↔WIND |
 | BACK | sleep | | |
 
 README/BRIEF kan avvika (t.ex. “dubbel = AUTO”) — följ `AutopilotWatchy.cpp` (`menuCmdFromLongHold`, `menuCmdFromPressCount`).

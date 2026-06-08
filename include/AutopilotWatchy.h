@@ -45,6 +45,7 @@ private:
 
   bool activeSession = false;
   bool sessionNeedsDisplay = false;
+  int8_t lastWifiRssiDbm = -127;
 
   bool refreshFromSignalK();
   void applySkSnapshot(const SkAutopilotSnapshot &snap);
@@ -60,9 +61,12 @@ private:
   bool executeSessionHeadingDelta(int delta);
   void waitButtonsReleased();
   void paintWatchFaceFull(bool reinitPanel);
+  void paintWatchFaceFromCache();
   void disconnectWifiBeforeDisplay();
+  bool displayNeedsRecovery() const;
+  uint16_t displaySettleMs() const;
   void refreshDisplaySafe();
-  void syncLiveDataBeforeDisplay();
+  bool syncLiveDataBeforeDisplay();
   void syncClockFromNtp();
   void finishSessionWithDisplay();
   void disconnectBeforeSleep();
@@ -74,6 +78,7 @@ private:
   int countPresses(uint64_t btnMask, uint16_t windowMs, uint8_t maxPresses = 255);
   bool isPressed(uint64_t btnMask);
   void vibePulse(uint16_t onMs);
+  void vibeWake();
   void vibeConfirmPause();
   void vibeSingle();
   void vibeDouble();
