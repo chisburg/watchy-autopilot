@@ -147,6 +147,7 @@ Hemma utan YDWG: samma **202/PENDING** på AUTO (curl 2026-06-02). Sim kan känn
 - GitHub: `chisburg/watchy-autopilot`
 - Watchy V2, USB `/dev/cu.usbserial-56230044801`
 - Pi: `openplotter` / `boat-pi`, repo `~/jubilon-signalk`
+- Hela båtstacken (Watchy ↔ Signal K ↔ YDWG ↔ Kindle): sibling `../jubilon/docs/system.md`
 
 ## Session 2026-06-03 — kodstatus (komplettering)
 
